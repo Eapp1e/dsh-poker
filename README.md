@@ -1,6 +1,6 @@
 # dsh-plugin-poker
 
-> **德州扑克牌桌：模型可调用的扑克工具、六种内置策略对手、可选的教练层，以及一个浏览器牌桌面板。**
+> **让 DeepSeek Harness 坐上德州扑克牌桌——在对话里出牌，在浏览器里看牌；六种性格的 AI 对手，一位可选的随桌教练，牌桌按钮从不往对话里发消息。**
 >
 > Texas Hold'em table for DeepSeek Harness: model-callable poker tools, six heuristic opponents, an optional coach, and a browser table whose buttons never post a chat message.
 
@@ -130,13 +130,6 @@ node test/pack.mjs    # 打包契约（dsh.bundle、一行描述、许可证等�
 ```
 
 每次 push 都会在 GitHub Actions 上跑（Node 20 / 22 矩阵）。
-
-## 已知限制
-
-- 牌局状态在进程内存里，宿主重启后牌桌消失（热重载不丢）；全场共享一张"当前牌桌"，暂不支持同时开两局。
-- 教练是启发式教练，不是解算器：读牌会错，它教的是推理方式，不是 GTO 答案。
-- `botBrain: 'model'` 时，等待决策的机器人底牌会出现在模型可见文本里（模型需要它才能决策）；想完全公平就用默认 `auto`。
-- AI 对手的每个决策是一次网络往返，所以轮到 AI 座位时界面会有"思考"停顿（最多每个决策 `aiTimeoutMs`）；想让牌局快就把席位数调小或把超时调短。
 
 想把它列进 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)？步骤与投稿条目见 [`SUBMISSION.md`](SUBMISSION.md)。变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
