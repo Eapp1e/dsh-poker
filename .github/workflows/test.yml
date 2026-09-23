@@ -1,0 +1,27 @@
+name: test
+
+# The whole suite is plain Node with zero dependencies, so there is nothing to
+# install before running it - which is the point: a reviewer (or the
+# awesome-dsh-plugin maintainers) can clone this repo and see it pass.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run every suite
+        run: npm test
+      - name: Check the package still packs
+        run: npm pack --dry-run

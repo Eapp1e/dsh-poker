@@ -1,0 +1,16 @@
+# Nothing here is part of the package: these are the development leftovers the
+# test harness and the live-reload loader create while the plugin is running.
+node_modules/
+dsh-poker-revisions/
+*.log
+npm-debug.log*
+.tmp/
+tmp-*
+*.tgz
+
+# Editor and OS noise.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

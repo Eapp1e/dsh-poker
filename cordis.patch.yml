@@ -1,0 +1,16 @@
+# The dsh-plugin-poker bundle patch: one insert over the profile root.
+#
+# The row is both halves of the plugin. As a Loader entry it registers the six
+# poker tools and (because this package declares `dsh.client`) the client module
+# scanner also picks it up as a browser roster row, so the same row gives the
+# agent its tools and the GUI its poker-table card.
+#
+# Installing this package as a bundle (`dsh plugin --profile web add <path>`)
+# applies this patch automatically. Installing it by hand (see README) means
+# adding one row to the profile's own cordis.patch.yml instead — adding this
+# file AND a hand-written row would load the plugin twice and collide on tool
+# names.
+
+- insert:
+    - id: poker
+      name: 'dsh-plugin-poker'

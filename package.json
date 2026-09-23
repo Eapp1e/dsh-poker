@@ -1,0 +1,65 @@
+{
+  "name": "dsh-plugin-poker",
+  "version": "0.1.0",
+  "description": "Texas Hold'em table for DeepSeek Harness: model-callable poker tools, six heuristic opponents, an optional coach, and a browser table whose buttons never post a chat message.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "SUBMISSION.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/run.mjs && node test/host.mjs && node test/client.mjs && node test/coach.mjs && node test/hot.mjs && node test/pack.mjs"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "poker",
+    "texas-holdem",
+    "no-limit-holdem",
+    "holdem"
+  ],
+  "license": "MIT",
+  "author": "Eapp1e",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Eapp1e/dsh-poker.git"
+  },
+  "homepage": "https://github.com/Eapp1e/dsh-poker#readme",
+  "bugs": {
+    "url": "https://github.com/Eapp1e/dsh-poker/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
