@@ -74,7 +74,7 @@ description:
 
 ## 4. 合并前维护者会核对什么（自查清单）
 
-- [ ] `npm test` 在干净环境（CI）里全绿：本包 6 个套件、共 940+ 条断言（其中 `test/pack.mjs` 专门核对下面这些条目）。
+- [ ] `npm test` 在干净环境（CI）里全绿：本包 6 个套件、共 960+ 条断言（其中 `test/pack.mjs` 专门核对下面这些条目）。
 - [ ] `npm pack --dry-run` 的产物里**有 `cordis.patch.yml`**，且 `package.json` 里有 `dsh.bundle`。
 - [ ] `package.json` 的 `description` 是**一行**，且与 README 首段一致。
 - [ ] README 里**没有**机器相关的绝对路径、没有个人会话 id、没有"待办/占位"字样。

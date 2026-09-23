@@ -24,9 +24,17 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Changed
 
-- Bots priced by the situation: a **shove or a large bet needs real equity** (a made-hand score
-  compared to pot odds was calling off with ace-high), and **preflop continuing ranges follow the
-  raise size** (wide against a 3BB open, tight against a shove).
+- **Bot preflop ranges, retuned against measurement.** The complaint was two-sided - "翻前弃牌率也太高"
+  and "allin 还喜欢跟" - and the old numbers caused both: the continuing range was 1.5x the *opening*
+  range (so 76% of bots continued against a big raise and 62% against a stack-committing one), while
+  the opening table was tight enough that 23% of hands were walked to the big blind. Now the width
+  comes from the **price and position**: the big blind, closing the action, defends wide; middle
+  positions do not; a stack-committing raise is continued only with the top 10% (median top 4%).
+  Measured over 3000 six-handed hands: walks 23% → **10%**, flops 59% → **57%**, and the hands that
+  continue against a shove are a genuine premium range instead of "anything whose price was right".
+- A **shove or a large bet needs real equity**: a made-hand score compared to pot odds was calling off
+  with ace-high, and a `commit` carve-out (strength ≥ 0.5 at a small SPR) was bypassing that rule for
+  every top pair once the pot had grown.
 - The seat tile no longer covers the centre column: the middle reserves room for the tallest tile,
   and 需跟 shows what the **hero** owes (and disappears when nothing is owed).
 - Sizing helper: preflop sizes are quoted in **big blinds** (2.5/3/4/6BB) instead of four identical
@@ -34,6 +42,10 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Fixed
 
+- **`playersBehind` did not measure position.** It walks the seat ring, and a full lap visits every
+  other seat, so every player counted every live opponent as "behind" them - the big blind, which
+  closes the action, was treated as having five players still to act and defended as tightly as under
+  the gun. It now counts only players who have **not acted yet**, which is what "behind" means.
 - **A hot reload could silently not happen.** The reloader stages a copy of `lib/*.js` under the OS
   temp directory, but the copies did not carry a module manifest - and module type is resolved from
   the file's own directory upwards, so in a temp tree with no `"type": "module"` above it Node read

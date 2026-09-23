@@ -133,6 +133,19 @@ globalThis.setTimeout = (fn, delay) => {
   return pendingTimers.length;
 };
 
+// Interval-shaped timers, recorded rather than run: the panel polls the host while
+// an AI seat is thinking, and the harness needs to see that it started (and that it
+// stops when the AI is done).
+const pendingIntervals = [];
+globalThis.setInterval = (fn, delay) => {
+  pendingIntervals.push({ fn, delay: delay ?? 0 });
+  return pendingIntervals.length;
+};
+globalThis.clearInterval = (handle) => {
+  const index = Number(handle) - 1;
+  if (index >= 0 && index < pendingIntervals.length) pendingIntervals[index] = null;
+};
+
 /** Run every queued timer, including the ones they queue in turn. */
 function runTimers(limit = 60) {
   let guard = 0;
@@ -2296,6 +2309,113 @@ check('the panel title wears the same framed mark',
   panelTitle !== undefined && walkAll(panelTitle).some((node) => String(node.props && node.props.className || '').split(' ').includes('dshp-iconTile'))
     && walkAll(panelTitle).some((node) => node.type === 'svg'),
   panelTitle ? flatten(panelTitle) : 'no panel title');
+
+// ---- the plugin's page in the settings dialog ---------------------------------
+
+// Registered into the settings slot, so the AI endpoint is configured where every
+// other plugin's settings live rather than in a bespoke popup.
+const settingsRegistration = registrations.find((entry) => entry.options.name === 'settings.section' && entry.options.id === 'poker');
+check('the client half registers a settings section', settingsRegistration !== undefined,
+  registrations.map((entry) => entry.options.name).join(', '));
+check('the settings section is labelled', typeof settingsRegistration?.options.label === 'string'
+  && settingsRegistration.options.label.length > 0, String(settingsRegistration?.options.label));
+
+/** Render the settings component with a scripted route answer. */
+async function renderSettings(settings, options = {}) {
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), method: (init && init.method) || 'GET', body: init && init.body ? JSON.parse(init.body) : null });
+    if (options.fail) throw new Error('offline');
+    if ((init && init.method) === 'POST') {
+      return { ok: true, json: async () => ({ ok: true, settings: { ...settings, ...(init && init.body ? JSON.parse(init.body) : {}) } }) };
+    }
+    return { ok: true, json: async () => ({ ok: true, settings }) };
+  };
+  try {
+    // The component fetches on mount, so the tree only has the form after the
+    // promise chain has settled: render, let microtasks drain, render again.
+    let after = walkAll(render(settingsRegistration.component, {}));
+    for (let attempt = 0; attempt < 20 && !after.some((node) => node.type === 'input'); attempt += 1) {
+      await new Promise((resolve) => process.nextTick(resolve));
+      after = walkAll(render(settingsRegistration.component, {}));
+    }
+    return { after, requests };
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const settingsPayload = {
+  enabled: true,
+  seats: 2,
+  baseUrl: 'https://api.example.test/v1',
+  model: 'test-model',
+  temperature: 0.5,
+  timeoutMs: 6000,
+  jsonMode: false,
+  maxTokens: 200,
+  hasApiKey: true,
+};
+const settingsRender = await renderSettings(settingsPayload);
+if (process.env.POKER_DEBUG_SETTINGS) {
+  console.log('DEBUG inputs:', settingsRender.after.filter((node) => node.type === 'input')
+    .map((node, index) => `${index}:${node.props.type}=${JSON.stringify(node.props.value ?? node.props.checked)}`)
+    .join(' | '));
+}
+check('the settings page reads the host route',
+  settingsRender.requests.some((entry) => entry.url === '/poker/settings' && entry.method === 'GET'),
+  JSON.stringify(settingsRender.requests));
+check('the settings page fills in the values', (() => {
+  const inputs = settingsRender.after.filter((node) => node.type === 'input');
+  const values = inputs.map((node) => node.props.value ?? node.props.checked);
+  return values.includes('test-model') && values.includes(2) && values.includes(true);
+})(), settingsRender.after.filter((node) => node.type === 'input').map((node) => JSON.stringify(node.props.value ?? node.props.checked)).join(', '));
+check('the key is shown as stored, never as a value', (() => {
+  const password = settingsRender.after.find((node) => node.props.type === 'password');
+  return password !== undefined && password.props.value === '' && typeof password.props.placeholder === 'string';
+})(), 'password field');
+check('the settings page offers a save', settingsRender.after.some((node) => node.type === 'button' && flatten(node).includes('\u4fdd\u5b58')));
+
+const settingsSave = settingsRender.after.find((node) => node.type === 'button' && flatten(node).includes('\u4fdd\u5b58'));
+if (settingsSave) {
+  await settingsSave.props.onClick();
+  await new Promise((resolve) => process.nextTick(resolve));
+  const post = settingsRender.requests.find((entry) => entry.method === 'POST');
+  check('saving posts the form, not the stored key',
+    post !== undefined && post.body.model === 'test-model' && post.body.apiKey === undefined,
+    JSON.stringify(post && post.body));
+}
+const settingsFailed = await renderSettings(settingsPayload, { fail: true });
+check('a dead host route says so instead of rendering an empty form',
+  flatten(settingsFailed.after).includes('\u5931\u8d25'), flatten(settingsFailed.after).slice(0, 80));
+
+// While an AI seat is thinking, the answer lands in the HOST: the page has to poll.
+const aiPendingView = { ...checkedMeta.view, pendingDecision: { kind: 'ai', seat: 1, name: '\u8001\u738b' } };
+coachFixtures.set('ai-harness', {
+  entries: [
+    { type: 'event', event: { type: 'tool/call', seq: 1, data: { callId: 'ai_call', name: 'poker_action', arguments: '{}' } } },
+    { type: 'event', event: { type: 'tool/result', seq: 2, data: { message: { source: { kind: 'tool', callId: 'ai_call' }, content: [] }, meta: { ...checkedMeta, view: aiPendingView } } } },
+  ],
+  hasMore: false,
+  revision: 1,
+});
+pendingIntervals.length = 0;
+setPanel(true, 'ai-harness');
+check('an AI seat on turn starts the poll', pendingIntervals.filter(Boolean).length > 0,
+  `intervals ${pendingIntervals.filter(Boolean).length}`);
+check('the poll is paced like a beat, not a spin', pendingIntervals.filter(Boolean).every((timer) => timer.delay >= 600),
+  JSON.stringify(pendingIntervals.filter(Boolean).map((timer) => timer.delay)));
+const messagesBefore = fetchRequests.length;
+const pollTimer = pendingIntervals.filter(Boolean)[0];
+if (pollTimer) pollTimer.fn();
+await new Promise((resolve) => process.nextTick(resolve));
+check('the poll asks the host for the table', fetchRequests.length > messagesBefore,
+  `${messagesBefore} -> ${fetchRequests.length}`);
+pendingIntervals.length = 0;
+setPanel(true, session.id);
+check('a table with no AI seat does not poll', pendingIntervals.filter(Boolean).length === 0,
+  `intervals ${pendingIntervals.filter(Boolean).length}`);
 
 // ---- an unsettled (running) call must render a placeholder, not throw ----
 

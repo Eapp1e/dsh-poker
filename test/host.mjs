@@ -70,9 +70,50 @@ const ctx = {
         },
       };
     }
+    if (name === 'settings') return settingsService;
     return undefined;
   },
+  // `inject` is how the plugin asks for an optional service; the harness runs the
+  // callback inline, which is what the real host does once the service is composed.
+  inject(names, callback) {
+    if (names.includes('settings') && settingsService) callback();
+    if (names.includes('webServer')) callback();
+  },
 };
+
+/**
+ * A stand-in for the host user-settings service: one live namespace, mutable, with
+ * the same `register/get/update` surface the plugin uses.
+ */
+const settingsService = (() => {
+  const sections = new Map();
+  return {
+    register(namespace, schema) {
+      if (sections.has(namespace)) throw new Error(`settings namespace "${namespace}" is already registered`);
+      const record = { schema, value: undefined, watchers: new Set() };
+      sections.set(namespace, record);
+      return {
+        get: () => record.value,
+        update: (patch) => {
+          record.value = record.schema({ ...(record.value ?? {}), ...patch });
+          for (const watcher of record.watchers) watcher();
+        },
+        replace: (section) => {
+          record.value = record.schema(section);
+        },
+        watch: (callback) => {
+          record.watchers.add(callback);
+          return () => record.watchers.delete(callback);
+        },
+      };
+    },
+    get(namespace) {
+      const record = sections.get(namespace);
+      if (!record) return undefined;
+      return record.value ?? record.schema({});
+    },
+  };
+})();
 
 plugin.apply(ctx);
 
@@ -409,6 +450,171 @@ check(
     && dealtAfterRebuy.json.view.players[0].stack > 0,
   json({ hand: dealtAfterRebuy.json.view.handNumber, out: dealtAfterRebuy.json.view.players[0].out, stack: dealtAfterRebuy.json.view.players[0].stack }),
 );
+
+// ── AI opponents: settings, prompt/parse, and the pause/resume contract ────
+
+const ai = await import('../lib/ai.js');
+
+check('the settings defaults are complete',
+  ['enabled', 'seats', 'baseUrl', 'model', 'temperature', 'timeoutMs'].every((key) => key in ai.AI_DEFAULTS),
+  Object.keys(ai.AI_DEFAULTS).join(','));
+check('settings are clamped, not trusted', (() => {
+  const wild = ai.normaliseSettings({ seats: 99, temperature: 9, timeoutMs: 1, baseUrl: 'https://x.test/v1///' });
+  return wild.seats === 8 && wild.temperature === 2 && wild.timeoutMs === 500 && wild.baseUrl === 'https://x.test/v1';
+})(), JSON.stringify(ai.normaliseSettings({ seats: 99, temperature: 9, timeoutMs: 1, baseUrl: 'https://x.test/v1///' })));
+check('an empty section yields the defaults',
+  ai.normaliseSettings(undefined).model === ai.AI_DEFAULTS.model && ai.normaliseSettings(null).enabled === false);
+
+const cannedMenu = { canCheck: false, canCall: true, canRaise: true, canAllIn: true, toCall: 200, minRaiseTo: 400, maxRaiseTo: 2000 };
+check('a JSON decision is parsed', (() => {
+  const parsed = ai.parseAiDecision('{"action":"raise","amount":600,"talk":"来"}', cannedMenu);
+  return parsed && parsed.action === 'raise' && parsed.amount === 600 && parsed.talk === '来';
+})(), 'plain JSON');
+check('a fenced answer is parsed', ai.parseAiDecision('```json\n{"action":"call"}\n```', cannedMenu)?.action === 'call');
+check('prose around the JSON is tolerated', ai.parseAiDecision('Sure! {"action":"fold"} ok', cannedMenu)?.action === 'fold');
+check('an illegal action is refused', ai.parseAiDecision('{"action":"check"}', cannedMenu) === null, 'check with a bet to face');
+check('an unknown action is refused', ai.parseAiDecision('{"action":"dance"}', cannedMenu) === null);
+check('nonsense is refused', ai.parseAiDecision('I fold.', cannedMenu) === null && ai.parseAiDecision('', cannedMenu) === null);
+check('a wild amount is clamped into the menu', (() => {
+  const low = ai.parseAiDecision('{"action":"raise","amount":1}', cannedMenu);
+  const high = ai.parseAiDecision('{"action":"raise","amount":999999}', cannedMenu);
+  return low.amount === 400 && high.amount === 2000;
+})());
+check('a raise without an amount is refused', ai.parseAiDecision('{"action":"raise"}', cannedMenu) === null);
+
+const promptState = (() => {
+  const state = plugin.__testState ?? null;
+  return state;
+})();
+void promptState;
+check('the system prompt asks for one JSON object',
+  /ONE JSON object/.test(ai.AI_SYSTEM_PROMPT) && /amount/.test(ai.AI_SYSTEM_PROMPT), ai.AI_SYSTEM_PROMPT.slice(0, 60));
+
+/** A fetch double: records the request, answers with whatever the test wants. */
+function fakeFetch(response) {
+  const calls = [];
+  const impl = async (url, options) => {
+    calls.push({ url, options, body: JSON.parse(options.body) });
+    if (response instanceof Error) throw response;
+    return response;
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+// The AI sees a REAL table: the engine's own pause state, not a hand-built stub.
+const engineModule = await import('../lib/engine.js');
+const aiPaused = engineModule.startHand(engineModule.createGame({
+  startingStack: 1000,
+  smallBlind: 50,
+  bigBlind: 100,
+  seed: 5,
+  bots: [{ name: 'A', style: 'tag' }, { name: 'B', style: 'tag' }],
+}));
+aiPaused.aiSeats = [1];
+const banked = engineModule.applyAction(aiPaused, { seat: 0, action: 'call' }, () => ({ action: 'call' }));
+check('an AI seat pauses the table', banked.pendingDecision && banked.pendingDecision.kind === 'ai' && banked.pendingDecision.seat === 1,
+  JSON.stringify(banked.pendingDecision));
+check('the paused table has not acted for the AI seat yet', banked.players[1].hasActed === false, String(banked.players[1].hasActed));
+check('the pause carries a legal menu and the seat cards',
+  banked.pendingDecision.legal && Array.isArray(banked.pendingDecision.cards) && banked.pendingDecision.cards.length === 2,
+  JSON.stringify(banked.pendingDecision.legal));
+
+const aiSeat = banked.pendingDecision.seat;
+const legalMenu = banked.pendingDecision.legal;
+const aiState = banked;
+
+const settingsFor = (patch) => ai.normaliseSettings({ enabled: true, apiKey: 'sk-test', ...patch });
+const okFetch = fakeFetch({ ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"call"}' } }] }) });
+const aiDecision = await ai.askAi({ settings: settingsFor({}), state: aiState, seat: aiSeat, legal: legalMenu, fetchImpl: okFetch });
+check('a good answer becomes a decision', aiDecision && aiDecision.action === 'call', JSON.stringify(aiDecision));
+check('the request carries the key and the model',
+  okFetch.calls[0].options.headers.authorization === 'Bearer sk-test'
+    && okFetch.calls[0].body.model === ai.AI_DEFAULTS.model
+    && okFetch.calls[0].url.endsWith('/chat/completions'),
+  JSON.stringify(okFetch.calls[0].url));
+check('the prompt describes the real table',
+  okFetch.calls[0].body.messages[1].content.includes('\u5e95\u6c60') && okFetch.calls[0].body.messages[1].content.includes(`seat ${aiSeat}`),
+  okFetch.calls[0].body.messages[1].content.slice(0, 90));
+
+check('an HTTP error falls back to nothing', await ai.askAi({
+  settings: settingsFor({}), state: aiState, seat: aiSeat, legal: legalMenu,
+  fetchImpl: fakeFetch({ ok: false, status: 500, json: async () => ({}) }),
+}) === null);
+check('a network failure falls back to nothing', await ai.askAi({
+  settings: settingsFor({}), state: aiState, seat: aiSeat, legal: legalMenu, fetchImpl: fakeFetch(new Error('offline')),
+}) === null);
+check('a timeout falls back to nothing', await ai.askAi({
+  settings: settingsFor({}), state: aiState, seat: aiSeat, legal: legalMenu,
+  fetchImpl: () => Promise.reject(Object.assign(new Error('timed out'), { name: 'TimeoutError' })),
+}) === null);
+check('a disabled configuration never calls out', await (async () => {
+  const spy = fakeFetch({ ok: true, json: async () => ({}) });
+  const answer = await ai.askAi({ settings: ai.normaliseSettings({ enabled: false }), state: aiState, seat: aiSeat, legal: legalMenu, fetchImpl: spy });
+  return answer === null && spy.calls.length === 0;
+})());
+
+check('a raise is clamped into the paused menu', (() => {
+  const parsed = ai.parseAiDecision(`{"action":"raise","amount":9999999}`, legalMenu);
+  return parsed === null || (parsed.amount >= legalMenu.minRaiseTo && parsed.amount <= legalMenu.maxRaiseTo);
+})(), JSON.stringify(legalMenu));
+
+// Resume the way the host does: with a decision that fits the menu the pause carried.
+const resumeAction = legalMenu.canCheck ? 'check' : 'call';
+const resumed = engineModule.submitBotDecision(banked, { seat: aiSeat, action: resumeAction }, () => ({ action: 'check' }));
+check('resuming applies the AI action', resumed.actionSeq > banked.actionSeq,
+  `${banked.actionSeq} -> ${resumed.actionSeq}`);
+check('the AI seat acted on that street',
+  resumed.actionLog.some((entry) => entry.seat === aiSeat && entry.street === banked.street),
+  JSON.stringify(resumed.actionLog.map((entry) => `${entry.seat}:${entry.action}`)));
+// A pause may legitimately REAPPEAR: the same seat is on turn again on the next
+// street, and the host asks for a fresh decision there. What must not happen is the
+// old decision being reused for the new spot.
+check('a later pause is a new decision, not the old one',
+  !resumed.pendingDecision || resumed.pendingDecision.actionSeq !== banked.pendingDecision.actionSeq
+    || resumed.pendingDecision.street !== banked.pendingDecision.street,
+  JSON.stringify({ before: banked.pendingDecision.street, after: resumed.pendingDecision && resumed.pendingDecision.street }));
+
+// ── the settings route (the plugin's page in the settings dialog) ──────────
+
+const settingsGet = await request('GET', '/poker/settings');
+check('the settings route answers with defaults',
+  settingsGet.status === 200 && settingsGet.json.ok === true && settingsGet.json.settings.enabled === false,
+  JSON.stringify(settingsGet.json));
+check('the settings route never echoes the key',
+  settingsGet.json.settings.apiKey === undefined && settingsGet.json.settings.hasApiKey === false,
+  JSON.stringify(settingsGet.json.settings));
+
+const settingsPost = await request('POST', '/poker/settings', {
+  enabled: true,
+  seats: 2,
+  baseUrl: 'https://example.test/v1/',
+  apiKey: 'sk-secret',
+  model: 'test-model',
+});
+check('the settings route saves', settingsPost.status === 200 && settingsPost.json.settings.enabled === true,
+  JSON.stringify(settingsPost.json).slice(0, 200));
+check('the saved URL is normalised', settingsPost.json.settings.baseUrl === 'https://example.test/v1',
+  settingsPost.json.settings.baseUrl);
+check('the save reports the key without returning it',
+  settingsPost.json.settings.hasApiKey === true && settingsPost.json.settings.apiKey === undefined,
+  JSON.stringify(settingsPost.json.settings));
+check('the values come back on the next read',
+  settingsPost.json.settings.seats === 2 && settingsPost.json.settings.model === 'test-model',
+  JSON.stringify(settingsPost.json.settings));
+check('the values live in the host settings service',
+  settingsService.get('poker').model === 'test-model' && settingsService.get('poker').apiKey === 'sk-secret',
+  JSON.stringify(settingsService.get('poker')));
+
+const settingsBad = await request('POST', '/poker/settings', { seats: 99, temperature: 42 });
+check('out-of-range values are clamped, not rejected',
+  settingsBad.status === 200 && settingsBad.json.settings.seats === 8 && settingsBad.json.settings.temperature === 2,
+  JSON.stringify(settingsBad.json.settings));
+
+// Turning the AI off must leave the table playable: the next hand's seats are all
+// heuristics again.
+const settingsOff = await request('POST', '/poker/settings', { enabled: false });
+check('the AI can be switched back off', settingsOff.json.settings.enabled === false, JSON.stringify(settingsOff.json.settings));
 
 // ── dispose contract ───────────────────────────────────────────────────────
 
