@@ -1,6 +1,6 @@
 # dsh-plugin-poker
 
-> **让 DeepSeek Harness 坐上德州扑克牌桌——在对话里出牌，在浏览器里看牌；六种性格的 AI 对手，一位可选的随桌教练，牌桌按钮从不往对话里发消息。**
+> **DeepSeek Harness 的德州扑克插件：无限注规则、机器人对手、真实感牌桌，教练模式讲解打法与赔率。**
 >
 > Texas Hold'em table for DeepSeek Harness: model-callable poker tools, six heuristic opponents, an optional coach, and a browser table whose buttons never post a chat message.
 
