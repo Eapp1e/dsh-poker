@@ -1,0 +1,8 @@
+# All text files use LF in the repo and on checkout, so the test suites read
+# the same bytes on Windows, Linux and CI.
+* text=auto eol=lf
+
+# Binaries (if any ever land here) must stay untouched.
+*.png binary
+*.jpg binary
+*.ico binary
