@@ -8,6 +8,19 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Added
 
+- **AI opponents over any OpenAI-compatible endpoint.** The plugin's own page in the
+  settings dialog (`settings.section`, `id: poker`) configures how many seats the AI plays plus
+  base URL, key, model, temperature, timeout and JSON mode; the values live in the host
+  user-settings document (`GET/POST /poker/settings`, and the key is never returned to the page).
+  The engine already knew how to pause for an external decision (the model-brain path), so an AI
+  turn is: pause, ask, `submitBotDecision`, advance - with the page polling while the seat thinks.
+  Every failure (timeout, offline, a non-200, an illegal action) falls back to the heuristic policy
+  for that seat, so a bad endpoint costs latency and nothing else.
+- **The opponents' rates now move with the table.** Each seat keeps a per-table tally of what the
+  others actually do (hands, voluntary entries, raises, bets faced, bets folded to), and nudges its
+  own tightness/aggression/bluff within a bounded range: a loose table gets tightened against, a
+  table that folds to pressure gets bluffed more, an aggressive table gets respected. The player's
+  own tendencies are part of that read.
 - A **submission guide** (`SUBMISSION.md`) plus CI (`.github/workflows/test.yml`) for listing the
   plugin in the community registry: what the entry looks like, what a reviewer checks, and the
   pre-flight commands.
@@ -42,6 +55,10 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Fixed
 
+- **The coach's advice badge wrapped.** A long recommendation ("弃牌：QTo（不同花）在关池位 CO 太弱…")
+  wrapped the "教练建议" label itself onto a second line and pushed the action buttons down. The badge
+  is one line now: the label never shrinks, the sentence takes the ellipsis, and the full text is the
+  tooltip.
 - **`playersBehind` did not measure position.** It walks the seat ring, and a full lap visits every
   other seat, so every player counted every live opponent as "behind" them - the big blind, which
   closes the action, was treated as having five players still to act and defended as tightly as under
