@@ -13,12 +13,13 @@ import {
   createGame,
   legalActions,
   MAX_BOTS,
+  emptyObservation,
   potTotal,
   startHand,
   submitBotDecision,
   viewFor,
 } from '../lib/engine.js';
-import { BOT_STYLES, boardTexture, decideBotAction, playersBehind, playsTheBoard, postflopStrength, preflopPercentile, preflopStrength } from '../lib/bots.js';
+import { BOT_STYLES, adjustStyle, boardTexture, decideBotAction, observedRead, playersBehind, playsTheBoard, postflopStrength, preflopPercentile, preflopStrength } from '../lib/bots.js';
 import { renderTable } from '../lib/render.js';
 
 let passed = 0;
@@ -458,6 +459,83 @@ for (const style of Object.keys(BOT_STYLES)) {
 }
 check('nobody calls off preflop with 7-2 offsuit', junkPreflopCalls <= 6, `${junkPreflopCalls} of 120`);
 
+// ── the same hand, two prices: the range has to follow the PRICE ────────────
+//
+// This is the coherence the player asked for. The old numbers gave the two spots
+// nearly the same range, so the table either folded everything to a 3BB open or
+// called off half a stack against a shove - both complaints at once.
+
+/**
+ * Six-max, folded to the big blind: the first seat opened to `raiseTo` and the big
+ * blind (the seat under test) closes the action.
+ */
+function stagedBigBlindFacing(style, raiseTo, seed, cards, stack = 2000) {
+  const state = startHand(createGame({
+    startingStack: stack,
+    smallBlind: 50,
+    bigBlind: 100,
+    seed,
+    bots: [1, 2, 3, 4, 5].map((slot) => ({ name: `B${slot}`, style })),
+  }));
+  const total = state.players.length;
+  const bigBlindSeat = state.bigBlindSeat;
+  const openerSeat = (bigBlindSeat + 1) % total;
+  state.players.forEach((player) => {
+    player.folded = false;
+    player.out = false;
+    player.allIn = false;
+    player.hasActed = false;
+  });
+  for (let step = 2; step < total; step += 1) {
+    const between = state.players[(bigBlindSeat + step) % total];
+    between.folded = true;
+    between.hasActed = true;
+  }
+  const opener = state.players[openerSeat];
+  opener.streetCommitted = raiseTo;
+  opener.handCommitted = raiseTo;
+  opener.hasActed = true;
+  if (raiseTo >= stack) {
+    opener.allIn = true;
+    opener.stack = 0;
+  }
+  state.players[bigBlindSeat].cards = cards.slice();
+  state.currentBet = raiseTo;
+  state.lastRaiseSize = Math.max(state.config.bigBlind, raiseTo - state.config.bigBlind);
+  state.street = 'preflop';
+  state.phase = 'betting';
+  state.actorSeat = bigBlindSeat;
+  return state;
+}
+
+const callVsSmall = (style, cards, seed) => decideBotAction(stagedBigBlindFacing(style, 300, seed, cards), 2).action;
+const callVsShove = (style, cards, seed) => decideBotAction(stagedBigBlindFacing(style, 2000, seed, cards), 2).action;
+const bigBlindSeatOf = (state) => state.bigBlindSeat;
+check('the staged spot really is the big blind', bigBlindSeatOf(stagedBigBlindFacing('tag', 300, 1, ['Ac', 'Kd'])) === 2,
+  String(bigBlindSeatOf(stagedBigBlindFacing('tag', 300, 1, ['Ac', 'Kd']))));
+
+// KQo is a top-13% hand: worth defending against a 3BB open, not worth a stack.
+check('a top-13% hand defends a small open', callVsSmall('tag', ['Kc', 'Qd'], 4242) !== 'fold', callVsSmall('tag', ['Kc', 'Qd'], 4242));
+check('the same hand folds to a 100BB shove', callVsShove('tag', ['Kc', 'Qd'], 4242) === 'fold', callVsShove('tag', ['Kc', 'Qd'], 4242));
+// 66 is a top-6% hand: it continues either way.
+check('a small pair continues against a small open', callVsSmall('tag', ['6c', '6d'], 4242) !== 'fold', callVsSmall('tag', ['6c', '6d'], 4242));
+check('a small pair still continues against a shove', callVsShove('tag', ['6c', '6d'], 4242) !== 'fold', callVsShove('tag', ['6c', '6d'], 4242));
+// Junk folds to both.
+check('junk folds to a small open too', callVsSmall('station', ['7c', '2d'], 4242) === 'fold', callVsSmall('station', ['7c', '2d'], 4242));
+check('junk folds to a shove', callVsShove('station', ['7c', '2d'], 4242) === 'fold', callVsShove('station', ['7c', '2d'], 4242));
+// Across every personality the shove range stays a premium range, and nobody folds
+// aces to a 3BB open.
+let shoveJunk = 0;
+let openAces = 0;
+for (const style of Object.keys(BOT_STYLES)) {
+  for (let seed = 1300; seed < 1330; seed += 1) {
+    if (callVsShove(style, ['Jc', 'Td'], seed) !== 'fold') shoveJunk += 1;
+    if (callVsSmall(style, ['Ac', 'Ad'], seed) !== 'fold') openAces += 1;
+  }
+}
+check('nobody stacks off with J-T offsuit against a shove', shoveJunk <= 10, `${shoveJunk} of 180`);
+check('every personality plays aces against a small open', openAces === 180, `${openAces} of 180`);
+
 // ── playing the board is not a made hand ───────────────────────────────────
 //
 // The real regression a player caught: a station called a river bet holding
@@ -841,6 +919,8 @@ function preflopField(players, hands) {
   let withNonBlind = 0;
   let noRaise = 0;
   let sawFlop = 0;
+  let multiway = 0;
+  let isolated = 0;
   for (let hand = 0; hand < hands; hand += 1) {
     let state = startHand(createGame({
       startingStack: 10000,
@@ -861,7 +941,11 @@ function preflopField(players, hands) {
       return decision;
     });
     const preflop = state.actionLog.filter((entry) => entry.street === 'preflop');
-    if (!preflop.some((entry) => entry.action === 'raise' || entry.action === 'allin')) noRaise += 1;
+    const raises = preflop.filter((entry) => entry.action === 'raise' || entry.action === 'allin').length;
+    const calls = preflop.filter((entry) => entry.action === 'call').length;
+    if (raises === 0) noRaise += 1;
+    if (raises === 1 && calls === 0) isolated += 1;
+    if (raises === 1 && calls >= 2) multiway += 1;
     if (state.board.length >= 3) sawFlop += 1;
     const entrants = new Set(preflop
       .filter((entry) => entry.action !== 'fold' && entry.action !== 'check')
@@ -876,7 +960,15 @@ function preflopField(players, hands) {
     const bucket = buckets.get(behind);
     return bucket ? bucket.raises / bucket.decisions : null;
   };
-  return { rate: withNonBlind / hands, foldRate, openRate, walkRate: noRaise / hands, flopRate: sawFlop / hands };
+  return {
+    rate: withNonBlind / hands,
+    foldRate,
+    openRate,
+    walkRate: noRaise / hands,
+    flopRate: sawFlop / hands,
+    isolatedRate: isolated / hands,
+    multiwayRate: multiway / hands,
+  };
 }
 
 const sixMaxField = preflopField(6, 200);
@@ -891,15 +983,151 @@ check(
 check('the button region is not folding everything', fullRingField.foldRate(2) < 0.75, String(fullRingField.foldRate(2)));
 
 // The complaint this guards: "翻前弃牌率也太高了" - a table where nobody opens and the
-// blinds chop it up. With the old, tighter range table 36% of hands had no raise at
-// all and only 28% reached a flop (measured over 3000 six-handed hands).
-check('a six-handed table rarely walks to the blinds', sixMaxField.walkRate < 0.2, `walk rate ${Math.round(sixMaxField.walkRate * 100)}%`);
-check('most six-handed hands see a flop', sixMaxField.flopRate > 0.33, `flop rate ${Math.round(sixMaxField.flopRate * 100)}%`);
-check('late position opens more often than early position',
-  sixMaxField.openRate(5) !== null && sixMaxField.openRate(1) !== null && sixMaxField.openRate(1) > sixMaxField.openRate(5) + 0.1,
-  `UTG open ${sixMaxField.openRate(5)} vs late open ${sixMaxField.openRate(1)}`);
-check('the late seats open a real range', sixMaxField.openRate(1) > 0.3, String(sixMaxField.openRate(1)));
-check('even the first seat opens something', sixMaxField.openRate(5) > 0.12, String(sixMaxField.openRate(5)));
+// blinds chop it up. Measured over 3000 six-handed hands with the same instrument:
+// the pre-turn policy walked 23% of hands, the first tightening overshot to 41%
+// flops, and the tuning in place now walks 10% and shows a flop in 57%.
+check('a six-handed table rarely walks to the blinds', sixMaxField.walkRate < 0.15, `walk rate ${Math.round(sixMaxField.walkRate * 100)}%`);
+check('most six-handed hands see a flop', sixMaxField.flopRate > 0.45, `flop rate ${Math.round(sixMaxField.flopRate * 100)}%`);
+check('an open does not always take it down', sixMaxField.isolatedRate < 0.35, `isolated ${Math.round(sixMaxField.isolatedRate * 100)}%`);
+check('multiway pots happen', sixMaxField.multiwayRate > 0.15, `multiway ${Math.round(sixMaxField.multiwayRate * 100)}%`);
+check('early position folds more than late position at six-handed too',
+  sixMaxField.foldRate(5) !== null && sixMaxField.foldRate(1) !== null && sixMaxField.foldRate(5) > sixMaxField.foldRate(1) + 0.1,
+  `UTG fold ${sixMaxField.foldRate(5)} vs late fold ${sixMaxField.foldRate(1)}`);
+
+/**
+ * How often one seat opens, over many real deals at a full table.
+ *
+ * The positional shape is the thing under test, so the seats are addressed by their
+ * distance from the big blind: 1 is under the gun (five still to act), 4 is the
+ * button (two: the small blind and the big blind).
+ */
+function openRateFor(style, seatFromBigBlind, iterations = 200) {
+  let opens = 0;
+  for (let index = 0; index < iterations; index += 1) {
+    const state = startHand(createGame({
+      startingStack: 2000,
+      smallBlind: 50,
+      bigBlind: 100,
+      seed: 4000 + index * 977,
+      bots: [1, 2, 3, 4, 5].map((slot) => ({ name: `B${slot}`, style })),
+    }));
+    state.players.forEach((player) => {
+      player.folded = false;
+      player.out = false;
+      player.allIn = false;
+      player.hasActed = false;
+    });
+    const seat = (state.bigBlindSeat + seatFromBigBlind) % state.players.length;
+    // Everyone who acts before this seat has already folded, which is what leaves
+    // the right number of players still to act behind it.
+    for (let step = 1; step < seatFromBigBlind; step += 1) {
+      const before = state.players[(state.bigBlindSeat + step) % state.players.length];
+      before.folded = true;
+      before.hasActed = true;
+    }
+    state.currentBet = state.config.bigBlind;
+    state.lastRaiseSize = state.config.bigBlind;
+    state.street = 'preflop';
+    state.phase = 'betting';
+    state.actorSeat = seat;
+    const decision = decideBotAction(state, seat);
+    if (decision.action === 'raise' || decision.action === 'allin') opens += 1;
+  }
+  return opens / iterations;
+}
+
+const utgOpen = openRateFor('tag', 1);
+const buttonOpen = openRateFor('tag', 4);
+const rockOpen = openRateFor('rock', 1);
+const maniacOpen = openRateFor('maniac', 1);
+check('the first seat to act still opens a real range', utgOpen > 0.22, `UTG open ${utgOpen}`);
+check('the button opens much wider than the first seat', buttonOpen > utgOpen + 0.12, `UTG ${utgOpen} vs button ${buttonOpen}`);
+check('a maniac opens far more than a rock', maniacOpen > rockOpen + 0.1, `rock ${rockOpen} vs maniac ${maniacOpen}`);
+check('even a rock opens something', rockOpen > 0.15, `rock UTG open ${rockOpen}`);
+
+// ── the opponents' rates move with the table ────────────────────────────────
+//
+// The request: "其他玩家的这些率也应该适当动态调整". A declared personality is the
+// starting point; what the table actually does moves it, and the counters survive
+// from hand to hand.
+
+/** A six-max preflop spot where the other seats carry a history. */
+function stagedTableRead(style, history) {
+  const state = startHand(createGame({
+    startingStack: 2000,
+    smallBlind: 50,
+    bigBlind: 100,
+    seed: 31,
+    bots: [1, 2, 3, 4, 5].map((slot) => ({ name: `B${slot}`, style })),
+  }));
+  state.players.forEach((player, index) => {
+    player.folded = false;
+    player.out = false;
+    player.allIn = false;
+    player.hasActed = false;
+    // Seat 0 is the reader; every other seat gets the supplied history.
+    player.observed = index === 0 ? emptyObservation() : { ...emptyObservation(), hands: 40, ...history };
+  });
+  state.currentBet = state.config.bigBlind;
+  state.lastRaiseSize = state.config.bigBlind;
+  state.street = 'preflop';
+  state.phase = 'betting';
+  state.actorSeat = 3;
+  return state;
+}
+
+const baselineStyle = BOT_STYLES.tag;
+const noHistory = adjustStyle(stagedTableRead('tag', {}), 3, baselineStyle);
+check('with no history the dials are the declared ones',
+  noHistory.tightness === baselineStyle.tightness && noHistory.bluff === baselineStyle.bluff,
+  JSON.stringify({ tightness: noHistory.tightness, bluff: noHistory.bluff }));
+check('a hand or two is not a read', (() => {
+  const state = stagedTableRead('tag', {});
+  state.players[1].observed = { ...emptyObservation(), hands: 2, vpip: 2 };
+  return adjustStyle(state, 3, baselineStyle).tightness === baselineStyle.tightness;
+})(), 'a 2-hand sample moved the dials');
+
+// A loose table (everyone plays everything) makes the seat tighter and quieter.
+const looseTable = adjustStyle(stagedTableRead('tag', { vpip: 34, pfr: 4, calls: 20, facedBet: 10, foldedToBet: 3 }), 3, baselineStyle);
+check('a loose table tightens a seat up', looseTable.tightness > baselineStyle.tightness, `${baselineStyle.tightness} -> ${looseTable.tightness}`);
+check('a loose table cuts the bluffing', looseTable.bluff < baselineStyle.bluff, `${baselineStyle.bluff} -> ${looseTable.bluff}`);
+
+// A table that folds to pressure gets bluffed and stolen from more.
+const foldyTable = adjustStyle(stagedTableRead('tag', { vpip: 8, pfr: 3, facedBet: 12, foldedToBet: 11 }), 3, baselineStyle);
+check('a table that folds to bets gets bluffed more', foldyTable.bluff > baselineStyle.bluff, `${baselineStyle.bluff} -> ${foldyTable.bluff}`);
+check('a foldy table raises the aggression', foldyTable.aggression > baselineStyle.aggression, `${baselineStyle.aggression} -> ${foldyTable.aggression}`);
+
+// An aggressive table gets respected: tighten, and do not loosen up with it.
+const aggroTable = adjustStyle(stagedTableRead('station', { vpip: 30, pfr: 26, bets: 24, facedBet: 8, foldedToBet: 2 }), 3, BOT_STYLES.station);
+check('an aggressive table tightens even a station', aggroTable.tightness > BOT_STYLES.station.tightness,
+  `${BOT_STYLES.station.tightness} -> ${aggroTable.tightness}`);
+check('the adjustment stays bounded', aggroTable.tightness - BOT_STYLES.station.tightness <= 0.12,
+  String(aggroTable.tightness - BOT_STYLES.station.tightness));
+check('the declared personality is still recognisable', aggroTable.tightness < BOT_STYLES.tag.tightness,
+  `${aggroTable.tightness} vs tag ${BOT_STYLES.tag.tightness}`);
+
+// The tally is fed by real play, and it survives into the next hand.
+let tallyState = startHand(createGame({
+  startingStack: 2000,
+  smallBlind: 50,
+  bigBlind: 100,
+  seed: 77,
+  bots: [{ name: 'A', style: 'tag' }],
+}));
+tallyState = { ...tallyState, players: tallyState.players.map((player) => ({ ...player, isHuman: false })) };
+tallyState = advance(tallyState, (current, seat) => decideBotAction(current, seat));
+const tallyAfter = tallyState.players.map((player) => player.observed);
+check('every seat carries a tally after a hand',
+  tallyAfter.every((tally) => tally && tally.hands === 1), JSON.stringify(tallyAfter[0]));
+check('the tally counts what the seat did',
+  tallyAfter.some((tally) => tally.folds > 0 || tally.calls > 0 || tally.bets > 0),
+  JSON.stringify(tallyAfter));
+const nextHand = startHand(tallyState);
+check('the tally survives into the next hand', nextHand.players.every((player) => player.observed.hands === 2),
+  JSON.stringify(nextHand.players.map((player) => player.observed.hands)));
+check('the per-hand counters do not leak into the next hand',
+  nextHand.players.every((player) => player.observed.calls === tallyState.players[player.seat].observed.calls),
+  'a per-hand field was reset');
 
 // ── view + render smoke test ────────────────────────────────────────────────
 
