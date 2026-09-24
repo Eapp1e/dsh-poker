@@ -99,7 +99,8 @@ const license = read('..', 'LICENSE');
 check('the LICENSE matches the declared license', license.includes(manifest.license), license.split('\n')[0]);
 check('the LICENSE is dated, not placeholder text', /Copyright \(c\) 20\d\d/.test(license), license.split('\n')[2]);
 check('a CHANGELOG exists', fs.existsSync(local('..', 'CHANGELOG.md')), 'missing CHANGELOG.md');
-check('the changelog has this release', /## \[0\.1\.0\]/.test(changelog), changelog.slice(0, 120));
+check('the changelog has this release',
+  new RegExp(`## \\[${manifest.version.replace(/\./g, '\\.')}\\]`).test(changelog), changelog.slice(0, 120));
 check('a CI workflow exists', fs.existsSync(local('..', '.github', 'workflows', 'test.yml')), 'missing CI');
 const ci = read('..', '.github', 'workflows', 'test.yml');
 check('CI runs the suite', ci.includes('npm test'), ci);

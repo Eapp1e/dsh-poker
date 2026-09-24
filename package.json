@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-poker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Texas Hold'em table for DeepSeek Harness: model-callable poker tools, six heuristic opponents, an optional coach, and a browser table whose buttons never post a chat message.",
   "type": "module",
   "main": "lib/index.js",
