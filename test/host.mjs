@@ -87,6 +87,14 @@ const ctx = {
  */
 const settingsService = (() => {
   const sections = new Map();
+  const require_ = (namespace) => {
+    const record = sections.get(namespace);
+    if (!record) throw new Error(`settings namespace "${namespace}" is not registered`);
+    return record;
+  };
+  const announce = (record) => {
+    for (const watcher of record.watchers) watcher();
+  };
   return {
     register(namespace, schema) {
       if (sections.has(namespace)) throw new Error(`settings namespace "${namespace}" is already registered`);
@@ -94,13 +102,8 @@ const settingsService = (() => {
       sections.set(namespace, record);
       return {
         get: () => record.value,
-        update: (patch) => {
-          record.value = record.schema({ ...(record.value ?? {}), ...patch });
-          for (const watcher of record.watchers) watcher();
-        },
-        replace: (section) => {
-          record.value = record.schema(section);
-        },
+        update: (patch) => this.update(namespace, patch),
+        replace: (section) => this.replace(namespace, section),
         watch: (callback) => {
           record.watchers.add(callback);
           return () => record.watchers.delete(callback);
@@ -111,6 +114,19 @@ const settingsService = (() => {
       const record = sections.get(namespace);
       if (!record) return undefined;
       return record.value ?? record.schema({});
+    },
+    // The provider's own write API, which is what a hot-reloaded module has to use: the
+    // scope from `register` belongs to the instance that registered, and a reloaded
+    // instance cannot register again.
+    update(namespace, patch) {
+      const record = require_(namespace);
+      record.value = record.schema({ ...(record.value ?? {}), ...patch });
+      announce(record);
+    },
+    replace(namespace, section) {
+      const record = require_(namespace);
+      record.value = record.schema(section);
+      announce(record);
     },
   };
 })();
@@ -407,11 +423,13 @@ check('a never-seen session finds the table that was just opened', adopted.view.
 // A short-stacked heads-up table that leaves the hero with nothing: the hero FOLDS
 // every hand until the blinds have eaten the stack. Folding rather than shoving is
 // deliberate - a bot that sensibly folds a shove leaves the shover winning blinds,
-// so the hero would grow a stack instead of losing one.
+// so the hero would grow a stack instead of losing one. The stack does get all-in as a
+// blind on the way down and can win one back, so this takes many hands; the bound is
+// generous because the point is the bust, not how quickly it happens.
 const shortTable = await call('poker_new_table', { botCount: 1, startingStack: 400, smallBlind: 50, bigBlind: 100, seed: 1 });
 const shortId = shortTable.meta.view.tableId;
 let bustedView = shortTable.meta.view;
-for (let attempt = 0; attempt < 60 && bustedView.players[0].stack > 0; attempt += 1) {
+for (let attempt = 0; attempt < 400 && bustedView.players[0].stack > 0; attempt += 1) {
   if (bustedView.canDealNext) {
     bustedView = (await call('poker_next_hand', {})).meta.view;
     continue;
@@ -432,11 +450,15 @@ check('a rebuy needs a positive amount', zeroRebuy.status === 400 && /大于 0/.
 
 const rebought = await request('POST', '/poker/rebuy', { tableId: shortId, amount: 4000 });
 check('the route rebuys a busted hero', rebought.status === 200 && rebought.json.ok === true, JSON.stringify(rebought.json).slice(0, 160));
-check('the rebuy tops the stack up', rebought.json.view.players[0].stack === 4000, String(rebought.json.view.players[0].stack));
+// Read defensively: a crashed test hides the failure message that explains it.
+const reboughtView = rebought.json && rebought.json.view ? rebought.json.view : null;
+check('the rebuy answers with the table', reboughtView !== null, JSON.stringify(rebought.json).slice(0, 200));
+check('the rebuy tops the stack up', reboughtView !== null && reboughtView.players[0].stack === 4000,
+  reboughtView ? String(reboughtView.players[0].stack) : JSON.stringify(rebought.json).slice(0, 200));
 check(
   'the rebuy puts the hero back in the game',
-  rebought.json.view.players[0].out !== true && rebought.json.view.gameOver === false && rebought.json.view.canDealNext === true,
-  json({ out: rebought.json.view.players[0].out, gameOver: rebought.json.view.gameOver, canDealNext: rebought.json.view.canDealNext }),
+  reboughtView !== null && reboughtView.players[0].out !== true && reboughtView.gameOver === false && reboughtView.canDealNext === true,
+  reboughtView ? json({ out: reboughtView.players[0].out, gameOver: reboughtView.gameOver, canDealNext: reboughtView.canDealNext }) : JSON.stringify(rebought.json).slice(0, 200),
 );
 
 const fundedRebuy = await request('POST', '/poker/rebuy', { tableId: shortId, amount: 1000 });
@@ -454,16 +476,17 @@ check(
 // ── AI opponents: settings, prompt/parse, and the pause/resume contract ────
 
 const ai = await import('../lib/ai.js');
+const settingsModule = await import('../lib/settings.js');
 
 check('the settings defaults are complete',
   ['enabled', 'seats', 'baseUrl', 'model', 'temperature', 'timeoutMs'].every((key) => key in ai.AI_DEFAULTS),
   Object.keys(ai.AI_DEFAULTS).join(','));
 check('settings are clamped, not trusted', (() => {
-  const wild = ai.normaliseSettings({ seats: 99, temperature: 9, timeoutMs: 1, baseUrl: 'https://x.test/v1///' });
-  return wild.seats === 8 && wild.temperature === 2 && wild.timeoutMs === 500 && wild.baseUrl === 'https://x.test/v1';
-})(), JSON.stringify(ai.normaliseSettings({ seats: 99, temperature: 9, timeoutMs: 1, baseUrl: 'https://x.test/v1///' })));
+  const wild = settingsModule.normaliseSettings({ aiSeats: 99, aiTemperature: 9, aiTimeoutMs: 1, aiBaseUrl: 'https://x.test/v1///' });
+  return wild.aiSeats === 8 && wild.aiTemperature === 2 && wild.aiTimeoutMs === 500 && wild.aiBaseUrl === 'https://x.test/v1';
+})(), JSON.stringify(settingsModule.normaliseSettings({ aiSeats: 99, aiTemperature: 9, aiTimeoutMs: 1, aiBaseUrl: 'https://x.test/v1///' })));
 check('an empty section yields the defaults',
-  ai.normaliseSettings(undefined).model === ai.AI_DEFAULTS.model && ai.normaliseSettings(null).enabled === false);
+  settingsModule.normaliseSettings(undefined).aiModel === ai.AI_DEFAULTS.model && settingsModule.normaliseSettings(null).aiEnabled === false);
 
 const cannedMenu = { canCheck: false, canCall: true, canRaise: true, canAllIn: true, toCall: 200, minRaiseTo: 400, maxRaiseTo: 2000 };
 check('a JSON decision is parsed', (() => {
@@ -524,7 +547,7 @@ const aiSeat = banked.pendingDecision.seat;
 const legalMenu = banked.pendingDecision.legal;
 const aiState = banked;
 
-const settingsFor = (patch) => ai.normaliseSettings({ enabled: true, apiKey: 'sk-test', ...patch });
+const settingsFor = (patch) => settingsModule.normaliseSettings({ aiEnabled: true, aiApiKey: 'sk-test', ...patch });
 const okFetch = fakeFetch({ ok: true, json: async () => ({ choices: [{ message: { content: '{"action":"call"}' } }] }) });
 const aiDecision = await ai.askAi({ settings: settingsFor({}), state: aiState, seat: aiSeat, legal: legalMenu, fetchImpl: okFetch });
 check('a good answer becomes a decision', aiDecision && aiDecision.action === 'call', JSON.stringify(aiDecision));
@@ -550,7 +573,7 @@ check('a timeout falls back to nothing', await ai.askAi({
 }) === null);
 check('a disabled configuration never calls out', await (async () => {
   const spy = fakeFetch({ ok: true, json: async () => ({}) });
-  const answer = await ai.askAi({ settings: ai.normaliseSettings({ enabled: false }), state: aiState, seat: aiSeat, legal: legalMenu, fetchImpl: spy });
+  const answer = await ai.askAi({ settings: settingsModule.normaliseSettings({ aiEnabled: false }), state: aiState, seat: aiSeat, legal: legalMenu, fetchImpl: spy });
   return answer === null && spy.calls.length === 0;
 })());
 
@@ -579,42 +602,377 @@ check('a later pause is a new decision, not the old one',
 
 const settingsGet = await request('GET', '/poker/settings');
 check('the settings route answers with defaults',
-  settingsGet.status === 200 && settingsGet.json.ok === true && settingsGet.json.settings.enabled === false,
-  JSON.stringify(settingsGet.json));
+  settingsGet.status === 200 && settingsGet.json.ok === true && settingsGet.json.settings.aiEnabled === false,
+  JSON.stringify(settingsGet.json).slice(0, 200));
 check('the settings route never echoes the key',
-  settingsGet.json.settings.apiKey === undefined && settingsGet.json.settings.hasApiKey === false,
+  settingsGet.json.settings.aiApiKey === undefined && settingsGet.json.settings.hasApiKey === false,
   JSON.stringify(settingsGet.json.settings));
 
+// The route sends the field DESCRIPTORS too, which is what lets the page draw itself:
+// adding a setting to `settings.js` shows up in the UI with no client change.
+const settingsGroups = settingsGet.json.groups;
+check('the settings route describes its fields', Array.isArray(settingsGroups) && settingsGroups.length === 5,
+  JSON.stringify((settingsGroups || []).map((group) => group.id)));
+check('the groups are the general/table/panel/AI/about ones',
+  ['general', 'table', 'panel', 'ai', 'about'].every((id) => (settingsGroups || []).some((group) => group.id === id)),
+  JSON.stringify((settingsGroups || []).map((group) => group.id)));
+check('every descriptor carries a control kind and a label',
+  (settingsGroups || []).every((group) => group.label && group.fields.every((field) => field.label && field.kind)),
+  JSON.stringify(settingsGroups && settingsGroups[0]));
+check('the on/off switches are in the general group',
+  (settingsGroups || []).some((group) => group.id === 'general'
+    && group.fields.some((field) => field.key === 'pluginEnabled' && field.kind === 'boolean')
+    && group.fields.some((field) => field.key === 'coachEnabled' && field.kind === 'boolean')
+    && group.fields.some((field) => field.key === 'showAdvice' && field.kind === 'boolean')),
+  JSON.stringify(settingsGroups && settingsGroups[0] && settingsGroups[0].fields.map((field) => field.key)));
+check('the table defaults are editable',
+  (settingsGroups || []).some((group) => group.id === 'table'
+    && group.fields.some((field) => field.key === 'botCount' && field.min === 1 && field.max === 8)
+    && group.fields.some((field) => field.key === 'botStyles' && Array.isArray(field.options))),
+  JSON.stringify(settingsGroups && settingsGroups[1] && settingsGroups[1].fields.map((field) => field.key)));
+check('the secret is described but its value is withheld',
+  (settingsGroups || []).some((group) => group.id === 'ai'
+    && group.fields.some((field) => field.key === 'aiApiKey' && field.kind === 'password' && field.value === '')),
+  JSON.stringify(settingsGroups && settingsGroups[3] && settingsGroups[3].fields.map((field) => field.key)));
+
 const settingsPost = await request('POST', '/poker/settings', {
-  enabled: true,
-  seats: 2,
-  baseUrl: 'https://example.test/v1/',
-  apiKey: 'sk-secret',
-  model: 'test-model',
+  pluginEnabled: false,
+  coachEnabled: false,
+  botCount: 3,
+  botStyles: 'lag',
+  aiEnabled: true,
+  aiSeats: 2,
+  aiBaseUrl: 'https://example.test/v1/',
+  aiApiKey: 'sk-secret',
+  aiModel: 'test-model',
 });
-check('the settings route saves', settingsPost.status === 200 && settingsPost.json.settings.enabled === true,
+check('the settings route saves', settingsPost.status === 200 && settingsPost.json.settings.aiEnabled === true,
   JSON.stringify(settingsPost.json).slice(0, 200));
-check('the saved URL is normalised', settingsPost.json.settings.baseUrl === 'https://example.test/v1',
-  settingsPost.json.settings.baseUrl);
+check('the saved URL is normalised', settingsPost.json.settings.aiBaseUrl === 'https://example.test/v1',
+  settingsPost.json.settings.aiBaseUrl);
 check('the save reports the key without returning it',
-  settingsPost.json.settings.hasApiKey === true && settingsPost.json.settings.apiKey === undefined,
+  settingsPost.json.settings.hasApiKey === true && settingsPost.json.settings.aiApiKey === undefined,
   JSON.stringify(settingsPost.json.settings));
 check('the values come back on the next read',
-  settingsPost.json.settings.seats === 2 && settingsPost.json.settings.model === 'test-model',
+  settingsPost.json.settings.aiSeats === 2 && settingsPost.json.settings.aiModel === 'test-model'
+    && settingsPost.json.settings.botCount === 3 && settingsPost.json.settings.botStyles === 'lag',
   JSON.stringify(settingsPost.json.settings));
+check('the on/off switches persisted',
+  settingsPost.json.settings.pluginEnabled === false && settingsPost.json.settings.coachEnabled === false,
+  JSON.stringify({ plugin: settingsPost.json.settings.pluginEnabled, coach: settingsPost.json.settings.coachEnabled }));
 check('the values live in the host settings service',
-  settingsService.get('poker').model === 'test-model' && settingsService.get('poker').apiKey === 'sk-secret',
+  settingsService.get('poker').aiModel === 'test-model' && settingsService.get('poker').aiApiKey === 'sk-secret',
   JSON.stringify(settingsService.get('poker')));
+// A page cannot otherwise tell "saved" from "saved and in force": the host reports what it
+// is running, which is also how a page detects an older host (it reports nothing at all).
+check('the settings write reports what the host applied',
+  settingsPost.json.applied !== undefined
+    && settingsPost.json.applied.coachMode === 'simple'
+    && settingsPost.json.applied.coachEnabled === false,
+  JSON.stringify(settingsPost.json.applied));
 
-const settingsBad = await request('POST', '/poker/settings', { seats: 99, temperature: 42 });
+const settingsBad = await request('POST', '/poker/settings', { aiSeats: 99, aiTemperature: 42, botStyles: 'nonsense' });
 check('out-of-range values are clamped, not rejected',
-  settingsBad.status === 200 && settingsBad.json.settings.seats === 8 && settingsBad.json.settings.temperature === 2,
+  settingsBad.status === 200 && settingsBad.json.settings.aiSeats === 8 && settingsBad.json.settings.aiTemperature === 2,
   JSON.stringify(settingsBad.json.settings));
+check('an unknown option falls back to the schema default',
+  settingsBad.json.settings.botStyles === 'mixed', String(settingsBad.json.settings.botStyles));
+check('a select whose default is a number survives normalisation',
+  settingsModule.normaliseSettings({ replaySpeed: 2 }).replaySpeed === 2
+    && settingsModule.normaliseSettings({}).replaySpeed === 1,
+  JSON.stringify(settingsModule.normaliseSettings({ replaySpeed: 2 }).replaySpeed));
+check('the big blind is never below the small blind', (() => {
+  const settings = settingsModule.normaliseSettings({ smallBlind: 500, bigBlind: 100 });
+  return settings.bigBlind >= settings.smallBlind;
+})(), JSON.stringify(settingsModule.normaliseSettings({ smallBlind: 500, bigBlind: 100 })));
+
+// The new-table defaults are what the route and the tool open with, when the caller
+// does not pass its own values.
+await request('POST', '/poker/settings', { aiEnabled: true, aiSeats: 2, botCount: 3, smallBlind: 25, bigBlind: 50 });
+const defaultTable = await request('POST', '/poker/new', {});
+check('a new table follows the configured defaults',
+  defaultTable.json.view.players.length === 4 && defaultTable.json.view.bigBlind === 50,
+  json({ players: defaultTable.json.view.players.length, bigBlind: defaultTable.json.view.bigBlind }));
+check('the configured AI seats are attached to a new table',
+  Array.isArray(defaultTable.json.view.aiSeats) && defaultTable.json.view.aiSeats.length === 2,
+  JSON.stringify(defaultTable.json.view.aiSeats));
+check('a caller-supplied argument still beats the defaults', (() => {
+  const players = defaultTable.json.view.players.length;
+  return players === 4;
+})(), `${defaultTable.json.view.players.length} seats`);
 
 // Turning the AI off must leave the table playable: the next hand's seats are all
 // heuristics again.
-const settingsOff = await request('POST', '/poker/settings', { enabled: false });
-check('the AI can be switched back off', settingsOff.json.settings.enabled === false, JSON.stringify(settingsOff.json.settings));
+const settingsOff = await request('POST', '/poker/settings', { aiEnabled: false });
+check('the AI can be switched back off', settingsOff.json.settings.aiEnabled === false, JSON.stringify(settingsOff.json.settings));
+
+// The coach switch is a real switch: off means the payload carries no analysis (the
+// table, the legal menu and the log are untouched). A paused table has no coach to
+// begin with, so this compares two tables opened the same way through the tool.
+await request('POST', '/poker/settings', { coachEnabled: false });
+const coachOffTable = await call('poker_new_table', { botCount: 1, startingStack: 2000, smallBlind: 25, bigBlind: 50, seed: 31 });
+check('the coach switch reaches the view',
+  coachOffTable.meta.view.coach === undefined && coachOffTable.meta.view.players.length === 2,
+  json({ coach: coachOffTable.meta.view.coach === undefined, players: coachOffTable.meta.view.players.length }));
+await request('POST', '/poker/settings', { coachEnabled: true });
+const coachOnTable = await call('poker_new_table', { botCount: 1, startingStack: 2000, smallBlind: 25, bigBlind: 50, seed: 31 });
+check('turning it back on restores the analysis',
+  coachOnTable.meta.view.coach !== undefined && Array.isArray(coachOnTable.meta.view.coach.sections),
+  json({ coach: Boolean(coachOnTable.meta.view.coach) }));
+check('the table itself is unaffected by the coach switch',
+  coachOnTable.meta.view.players.length === coachOffTable.meta.view.players.length
+    && coachOnTable.meta.view.handNumber === coachOffTable.meta.view.handNumber,
+  json({ on: coachOnTable.meta.view.handNumber, off: coachOffTable.meta.view.handNumber }));
+
+// The coach STYLE is a setting as well: it reaches the coach that produced the payload, and
+// the payload reports which one it was so a surface can label itself. Preflop gets the GTO
+// layer too - leaving it out was the bug a player hit, because most decisions ARE preflop.
+await request('POST', '/poker/settings', { coachMode: 'gto' });
+const gtoTable = await call('poker_new_table', { botCount: 1, startingStack: 2000, smallBlind: 25, bigBlind: 50, seed: 31 });
+check('the coach style setting reaches the payload',
+  gtoTable.meta.view.coach !== undefined && typeof gtoTable.meta.view.coach.mode === 'string',
+  json({ mode: gtoTable.meta.view.coach && gtoTable.meta.view.coach.mode }));
+check('a preflop payload is produced by the GTO coach',
+  gtoTable.meta.view.coach.mode === 'gto', String(gtoTable.meta.view.coach.mode));
+check('the preflop GTO payload carries preflop numbers',
+  gtoTable.meta.view.coach.gto !== null
+    && gtoTable.meta.view.coach.gto.street === 'preflop'
+    && Number.isFinite(gtoTable.meta.view.coach.gto.topShare)
+    && typeof gtoTable.meta.view.coach.gto.role === 'string'
+    && gtoTable.meta.view.coach.gto.mdf === null,
+  json(gtoTable.meta.view.coach.gto));
+check('the preflop GTO payload carries its two sections',
+  gtoTable.meta.view.coach.sections.some((section) => section.id === 'gto')
+    && gtoTable.meta.view.coach.sections.some((section) => section.id === 'range'),
+  gtoTable.meta.view.coach.sections.map((section) => section.id).join(','));
+await request('POST', '/poker/settings', { coachMode: 'simple' });
+const backToSimple = await call('poker_new_table', { botCount: 1, startingStack: 2000, smallBlind: 25, bigBlind: 50, seed: 31 });
+check('switching back is a real switch',
+  backToSimple.meta.view.coach.mode === 'simple' && backToSimple.meta.view.coach.gto === null,
+  json({ mode: backToSimple.meta.view.coach.mode, gto: backToSimple.meta.view.coach.gto }));
+check('an unknown coach style falls back to simple',
+  settingsModule.normaliseSettings({ coachMode: 'solver' }).coachMode === 'simple',
+  settingsModule.normaliseSettings({ coachMode: 'solver' }).coachMode);
+
+// ── 测试连通: the endpoint probe ───────────────────────────────────────────
+
+const realFetch = globalThis.fetch;
+try {
+  globalThis.fetch = async (url, init) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ model: 'test-model', choices: [{ message: { content: 'pong' } }] }),
+  });
+  const tested = await request('POST', '/poker/settings-test', {});
+  check('the connection test reports a round trip',
+    tested.status === 200 && tested.json.ok === true && tested.json.result.ok === true
+      && tested.json.result.reply === 'pong',
+    JSON.stringify(tested.json).slice(0, 200));
+  check('the connection test reports how long it took',
+    Number.isFinite(tested.json.result.ms) && tested.json.result.ms >= 0, JSON.stringify(tested.json.result));
+  check('the connection test reports the model the endpoint answered with',
+    tested.json.result.model === 'test-model', JSON.stringify(tested.json.result));
+
+  // The body on screen wins over what is stored, so a key can be tested before saving.
+  const testedDraft = await request('POST', '/poker/settings-test', { aiModel: 'draft-model' });
+  check('an unsaved draft is what gets tested', testedDraft.json.result.ok === true,
+    JSON.stringify(testedDraft.json.result));
+
+  globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => 'invalid api key' });
+  const refused = await request('POST', '/poker/settings-test', {});
+  check('a refused key is reported with the status and the body',
+    refused.json.result.ok === false && refused.json.result.error.includes('401')
+      && refused.json.result.error.includes('invalid api key'),
+    JSON.stringify(refused.json.result));
+
+  globalThis.fetch = async () => {
+    throw Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+  };
+  const timedOut = await request('POST', '/poker/settings-test', {});
+  check('a timeout is reported as a timeout',
+    timedOut.json.result.ok === false && /超时/.test(timedOut.json.result.error),
+    JSON.stringify(timedOut.json.result));
+} finally {
+  globalThis.fetch = realFetch;
+}
+
+// ── 检查更新: the release check ────────────────────────────────────────────
+
+const updateModule = await import('../lib/update.js');
+const manifest = JSON.parse((await import('node:fs')).readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+check('versions compare the way a person reads them',
+  updateModule.compareVersions('0.1.0', '0.2.0') < 0
+    && updateModule.compareVersions('1.0.0', '0.9.9') > 0
+    && updateModule.compareVersions('v0.1.0', '0.1.0') === 0
+    && updateModule.compareVersions('0.1.0', '0.1.1') < 0,
+  JSON.stringify([
+    updateModule.compareVersions('0.1.0', '0.2.0'),
+    updateModule.compareVersions('1.0.0', '0.9.9'),
+    updateModule.compareVersions('v0.1.0', '0.1.0'),
+    updateModule.compareVersions('0.1.0', '0.1.1'),
+  ]));
+check('a tag without numbers still compares', updateModule.compareVersions('beta', 'alpha') > 0);
+check('the default repository is this plugin\'s own',
+  updateModule.DEFAULT_REPO === 'Eapp1e/dsh-poker', updateModule.DEFAULT_REPO);
+check('the default repository matches package.json', (() => {
+  const url = String(manifest.repository && manifest.repository.url || '');
+  return url.includes(updateModule.DEFAULT_REPO);
+})(), String(manifest.repository && manifest.repository.url));
+
+const settingsWithVersion = await request('GET', '/poker/settings');
+check('the settings page is told the installed version',
+  typeof settingsWithVersion.json.version === 'string' && /^\d+\.\d+\.\d+/.test(settingsWithVersion.json.version),
+  String(settingsWithVersion.json.version));
+check('the version also arrives as an info field',
+  (settingsWithVersion.json.groups || []).some((group) => group.fields.some((field) => field.kind === 'info' && /^v\d/.test(String(field.value)))),
+  JSON.stringify((settingsWithVersion.json.groups || []).map((group) => group.id)));
+check('the about group carries the release action',
+  (settingsWithVersion.json.groups || []).some((group) => group.id === 'about'
+    && group.fields.some((field) => field.kind === 'action' && field.action === 'update-check')),
+  JSON.stringify((settingsWithVersion.json.groups || []).find((group) => group.id === 'about')));
+
+/** A GitHub API double: answers by URL pattern. */
+const githubDouble = (handlers) => async (url) => {
+  for (const [pattern, answer] of handlers) {
+    if (String(url).includes(pattern)) {
+      if (answer instanceof Error) throw answer;
+      return {
+        ok: answer.status === 200,
+        status: answer.status,
+        json: async () => answer.json,
+        text: async () => JSON.stringify(answer.json ?? ''),
+      };
+    }
+  }
+  return { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+};
+
+try {
+  globalThis.fetch = githubDouble([
+    ['/releases/latest', { status: 200, json: { tag_name: 'v9.9.9', html_url: 'https://github.com/Eapp1e/dsh-poker/releases/tag/v9.9.9', body: '很多新东西', published_at: '2026-01-01T00:00:00Z' } }],
+  ]);
+  const newer = await request('POST', '/poker/update-check', { force: true });
+  check('a newer release is reported as newer',
+    newer.status === 200 && newer.json.result.ok === true && newer.json.result.behind === true,
+    JSON.stringify(newer.json).slice(0, 200));
+  check('the newer release names both versions and the url',
+    newer.json.result.latest === 'v9.9.9' && newer.json.result.url.includes('v9.9.9')
+      && newer.json.result.lines.join(' ').includes('9.9.9'),
+    JSON.stringify(newer.json.result.lines));
+  check('the upgrade command is spelled out',
+    newer.json.result.lines.some((line) => line.includes('dsh plugin')), JSON.stringify(newer.json.result.lines));
+
+  globalThis.fetch = githubDouble([
+    ['/releases/latest', { status: 200, json: { tag_name: `v${settingsWithVersion.json.version}` } }],
+  ]);
+  const same = await request('POST', '/poker/update-check', { force: true });
+  check('the current version reports as up to date',
+    same.json.result.behind === false && same.json.result.lines.join(' ').includes('已是最新'),
+    JSON.stringify(same.json.result.lines));
+
+  // Many repositories only tag: the check has to fall back rather than give up.
+  globalThis.fetch = githubDouble([
+    ['/releases/latest', { status: 404, json: {} }],
+    ['/tags', { status: 200, json: [{ name: 'v3.0.0' }] }],
+  ]);
+  const tagged = await request('POST', '/poker/update-check', { force: true });
+  check('a repository with only tags still answers',
+    tagged.json.result.ok === true && tagged.json.result.source === 'tag' && tagged.json.result.latest === 'v3.0.0',
+    JSON.stringify(tagged.json.result));
+
+  globalThis.fetch = githubDouble([['/releases/latest', { status: 404, json: {} }], ['/tags', { status: 404, json: {} }]]);
+  const missing = await request('POST', '/poker/update-check', { force: true });
+  check('a missing repository is explained, not thrown',
+    missing.status === 200 && missing.json.result.ok === false && missing.json.result.lines.join(' ').includes('没找到仓库'),
+    JSON.stringify(missing.json.result.lines));
+
+  globalThis.fetch = githubDouble([['/releases/latest', { status: 403, json: {} }]]);
+  const limited = await request('POST', '/poker/update-check', { force: true });
+  check('rate limiting is explained', limited.json.result.ok === false && /限流/.test(limited.json.result.lines.join(' ')),
+    JSON.stringify(limited.json.result.lines));
+
+  globalThis.fetch = async () => {
+    throw Object.assign(new Error('timed out'), { name: 'TimeoutError' });
+  };
+  const offline = await request('POST', '/poker/update-check', { force: true });
+  check('an offline machine gets a sentence, not an error',
+    offline.status === 200 && offline.json.result.ok === false && /超时/.test(offline.json.result.lines.join(' ')),
+    JSON.stringify(offline.json.result.lines));
+
+  // The repository is a setting, so a fork can check itself - and the cache means one
+  // lookup per window instead of one per settings open.
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    calls += 1;
+    return { ok: true, status: 200, json: async () => ({ tag_name: 'v9.9.9' }) };
+  };
+  await request('POST', '/poker/update-check', { updateRepo: 'someone/else' });
+  await request('POST', '/poker/update-check', { updateRepo: 'someone/else' });
+  await request('POST', '/poker/update-check', { updateRepo: 'someone/else', force: true });
+  check('a non-default repository is honoured and cached', calls === 2, `${calls} requests for 3 checks`);
+} finally {
+  globalThis.fetch = realFetch;
+}
+
+// ── switching the coach style from the coach window ────────────────────────
+//
+// The coach window can switch the style itself, so a settings write has to change the
+// analysis on the table that is ALREADY open - not just the next one. That means the
+// host re-saves the table (which stamps the setting onto it and bumps the revision the
+// panels poll for), and a live postflop view starts reporting GTO.
+
+/** Play until the hero is on turn with a flop out. */
+async function tableAtFlop(seed) {
+  let view = (await call('poker_new_table', { botCount: 1, startingStack: 4000, smallBlind: 25, bigBlind: 50, seed })).meta.view;
+  for (let step = 0; step < 30; step += 1) {
+    if (view.board.length >= 3 && view.legal) return view;
+    if (view.canDealNext) {
+      view = (await call('poker_next_hand', {})).meta.view;
+      continue;
+    }
+    if (!view.legal) return view;
+    view = (await call('poker_action', { action: view.legal.canCheck ? 'check' : 'call' })).meta.view;
+  }
+  return view;
+}
+
+await request('POST', '/poker/settings', { coachMode: 'simple', coachEnabled: true });
+const flopView = await tableAtFlop(4242);
+check('a live flop is on screen for the switch',
+  flopView.board.length >= 3 && flopView.legal !== null && flopView.coach !== undefined,
+  json({ board: flopView.board.length, legal: flopView.legal !== null, coach: Boolean(flopView.coach) }));
+check('the live table starts on the simple coach', flopView.coach.mode === 'simple', String(flopView.coach.mode));
+
+const styleSwitch = await request('POST', '/poker/settings', { coachMode: 'gto' });
+check('the settings write is accepted', styleSwitch.json.settings.coachMode === 'gto', json(styleSwitch.json.settings.coachMode));
+const afterSwitch = await request('POST', '/poker/current', {});
+check('switching re-saves the open table',
+  afterSwitch.json.view.revision > flopView.revision,
+  `${flopView.revision} -> ${afterSwitch.json.view.revision}`);
+check('the live table now reports the GTO coach',
+  afterSwitch.json.view.coach.mode === 'gto', String(afterSwitch.json.view.coach.mode));
+check('the GTO sections are on the live table',
+  afterSwitch.json.view.coach.sections.some((section) => section.id === 'gto')
+    && afterSwitch.json.view.coach.sections.some((section) => section.id === 'range'),
+  afterSwitch.json.view.coach.sections.map((section) => section.id).join(','));
+check('the GTO numbers are on the live table',
+  afterSwitch.json.view.coach.gto !== null
+    && typeof afterSwitch.json.view.coach.gto.role === 'string'
+    && Array.isArray(afterSwitch.json.view.coach.gto.ev)
+    && afterSwitch.json.view.coach.gto.ev.length > 0,
+  JSON.stringify(afterSwitch.json.view.coach.gto));
+// Checked to means there is no bet to defend against, so MDF is not a number - the
+// field is null rather than invented.
+check('a check-to spot reports no MDF',
+  afterSwitch.json.view.coach.gto.mdf === null || Number.isFinite(afterSwitch.json.view.coach.gto.mdf),
+  JSON.stringify({ mdf: afterSwitch.json.view.coach.gto.mdf, toCall: afterSwitch.json.view.legal.toCall }));
+
+await request('POST', '/poker/settings', { coachMode: 'simple' });
+const backAgain = await request('POST', '/poker/current', {});
+check('switching back changes the live table too',
+  backAgain.json.view.coach.mode === 'simple'
+    && !backAgain.json.view.coach.sections.some((section) => section.id === 'gto'),
+  String(backAgain.json.view.coach.mode));
 
 // ── dispose contract ───────────────────────────────────────────────────────
 

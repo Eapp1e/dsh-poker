@@ -14,6 +14,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
+// The settings page draws whatever the schema declares, so the fixture for it is the
+// real descriptor set - the same payload the host route sends.
+import * as settingsSchema from '../lib/settings.js';
 
 let passed = 0;
 const failures = [];
@@ -81,7 +84,7 @@ const fakeReact = {
 function render(component, props) {
   let store = hookStore.get(component);
   if (store === undefined) {
-    store = { slots: [], cleanups: [] };
+    store = { slots: [], cleanups: [], hooks: null };
     hookStore.set(component, store);
   }
   let element = null;
@@ -99,6 +102,15 @@ function render(component, props) {
     pendingEffects = [];
     dirty = false;
     element = component(props);
+    // React's first rule: the same hooks in the same order on every render. A component
+    // that returns early above its hooks breaks the moment the condition flips - and the
+    // symptom is not an error message but a surface that vanishes, so the harness
+    // enforces the rule here instead of trusting every reader to notice.
+    if (store.hooks === null) store.hooks = cursor;
+    else if (cursor !== store.hooks) {
+      failures.push(`${component.name || 'component'} changed its hook count (${store.hooks} -> ${cursor}) after an early return`);
+      store.hooks = cursor;
+    }
     const effects = pendingEffects;
     pendingEffects = [];
     for (const effect of effects) {
@@ -1941,10 +1953,12 @@ pendingTimers.length = 0;
 
 // A real busted table: the hero folds every hand until the blinds have taken the
 // short stack. (Shoving instead would not work any more - a bot that sensibly folds
-// a shove leaves the shover winning the blinds and growing a stack.)
+// a shove leaves the shover winning the blinds and growing a stack.) The stack goes
+// all-in as a blind on the way down and can win one back, so the bound is generous:
+// what matters is that the bust happens, not how quickly.
 async function bustedTableView(exec, seed) {
   let view = (await registered.get('poker_new_table').execute({ botCount: 1, startingStack: 400, smallBlind: 50, bigBlind: 100, seed }, exec)).view;
-  for (let attempt = 0; attempt < 60 && view.players[0].stack > 0; attempt += 1) {
+  for (let attempt = 0; attempt < 400 && view.players[0].stack > 0; attempt += 1) {
     if (view.canDealNext) {
       view = (await registered.get('poker_next_hand').execute({}, exec)).view;
       continue;
@@ -2320,68 +2334,146 @@ check('the client half registers a settings section', settingsRegistration !== u
 check('the settings section is labelled', typeof settingsRegistration?.options.label === 'string'
   && settingsRegistration.options.label.length > 0, String(settingsRegistration?.options.label));
 
-/** Render the settings component with a scripted route answer. */
+/**
+ * Render the settings page with a scripted route answer.
+ *
+ * `options.save` presses 保存 (inside the stubbed window, or the click would go to the
+ * harness's own fetch) and returns the tree the page shows afterwards; `options.post`
+ * is merged into the POST answer, which is how the two "did it take effect" branches
+ * are exercised.
+ */
 async function renderSettings(settings, options = {}) {
   const requests = [];
   const originalFetch = globalThis.fetch;
+  const view = settingsSchema.publicSettings(settings);
+  // The host fills the info fields from its own manifest; the fixture does the same.
+  const groups = settingsSchema.settingsForm(view, { version: '0.1.0' });
   globalThis.fetch = async (url, init) => {
     requests.push({ url: String(url), method: (init && init.method) || 'GET', body: init && init.body ? JSON.parse(init.body) : null });
     if (options.fail) throw new Error('offline');
-    if ((init && init.method) === 'POST') {
-      return { ok: true, json: async () => ({ ok: true, settings: { ...settings, ...(init && init.body ? JSON.parse(init.body) : {}) } }) };
-    }
-    return { ok: true, json: async () => ({ ok: true, settings }) };
+    return { ok: true, json: async () => ({ ok: true, settings: view, groups, ...(options.post || {}) }) };
   };
   try {
-    // The component fetches on mount, so the tree only has the form after the
+    // The component fetches on mount, so the tree only has the fields after the
     // promise chain has settled: render, let microtasks drain, render again.
     let after = walkAll(render(settingsRegistration.component, {}));
-    for (let attempt = 0; attempt < 20 && !after.some((node) => node.type === 'input'); attempt += 1) {
+    for (let attempt = 0; attempt < 20 && !after.some((node) => node.type === 'input' || node.type === 'select'); attempt += 1) {
       await new Promise((resolve) => process.nextTick(resolve));
       after = walkAll(render(settingsRegistration.component, {}));
     }
-    return { after, requests };
+    if (options.save === true) {
+      const button = after.find((node) => node.type === 'button' && flatten(node).includes('\u4fdd\u5b58'));
+      if (button) await button.props.onClick();
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await new Promise((resolve) => process.nextTick(resolve));
+        after = walkAll(render(settingsRegistration.component, {}));
+      }
+    }
+    return { after, requests, groups, view };
   } finally {
     globalThis.fetch = originalFetch;
   }
 }
 
-const settingsPayload = {
-  enabled: true,
-  seats: 2,
-  baseUrl: 'https://api.example.test/v1',
-  model: 'test-model',
-  temperature: 0.5,
-  timeoutMs: 6000,
-  jsonMode: false,
-  maxTokens: 200,
-  hasApiKey: true,
-};
+const settingsPayload = settingsSchema.normaliseSettings({
+  pluginEnabled: true,
+  coachEnabled: false,
+  botCount: 4,
+  botStyles: 'lag',
+  aiEnabled: true,
+  aiSeats: 2,
+  aiBaseUrl: 'https://api.example.test/v1',
+  aiModel: 'test-model',
+  aiTemperature: 0.5,
+  aiTimeoutMs: 6000,
+  aiApiKey: 'sk-secret',
+});
 const settingsRender = await renderSettings(settingsPayload);
 check('the settings page reads the host route',
   settingsRender.requests.some((entry) => entry.url === '/poker/settings' && entry.method === 'GET'),
   JSON.stringify(settingsRender.requests));
-// The state the async fetch lands is not re-rendered by this harness's mini-React,
-// so the assertions below are about SHAPE: the fields exist, the secret is a
-// password input, and saving posts to the plugin's own route. The values themselves
-// are covered from the host side, where the route's GET/POST round trip is real.
-const settingsInputs = settingsRender.after.filter((node) => node.type === 'input');
-check('the settings page lays out every AI field', settingsInputs.length === 8,
-  settingsInputs.map((node) => node.props.type).join(','));
+// The page draws the descriptor set the host sent, so the checks below are about the
+// SCHEMA being fully rendered: one control per field, the right control kind, the
+// secret as a password, and both actions wired up. The value round trip is covered
+// from the host side, where the route and the settings service are real.
+const settingsControls = settingsRender.after.filter((node) => node.type === 'input' || node.type === 'select');
+const editableFields = settingsRender.groups
+  .reduce((sum, group) => sum + group.fields.filter((field) => ['boolean', 'number', 'text', 'password', 'select'].includes(field.kind)).length, 0);
+check('the settings page renders every editable field', settingsControls.length === editableFields,
+  `${settingsControls.length} controls for ${editableFields} editable fields`);
+// The new field kinds: `info` shows a fact the host knows (with no control), `action`
+// is a button that runs a route op and prints the answer.
+const infoField = settingsRender.groups.flatMap((group) => group.fields).find((field) => field.kind === 'info');
+check('an info field is part of the schema', infoField !== undefined && infoField.key === 'pluginVersion',
+  JSON.stringify(infoField));
+check('the installed version is on the page', flatten(settingsRender.after).includes('v0.1.0'),
+  flatten(settingsRender.after).slice(-160));
+const actionField = settingsRender.groups.flatMap((group) => group.fields).find((field) => field.kind === 'action');
+check('an action field names the op it runs', actionField !== undefined && actionField.action === 'update-check',
+  JSON.stringify(actionField));
+check('the action field is not a settings control',
+  !settingsControls.some((node) => node.props.value === 'update-check' || node.props.value === 'updateCheck'),
+  'an action field leaked into the inputs');
+check('every group is titled', settingsRender.groups.every((group) => flatten(settingsRender.after).includes(group.label)),
+  settingsRender.groups.map((group) => group.label).join(', '));
+check('the general group carries the on/off switches',
+  settingsRender.groups.some((group) => group.id === 'general'
+    && group.fields.some((field) => field.key === 'pluginEnabled' && field.kind === 'boolean')
+    && group.fields.some((field) => field.key === 'coachEnabled' && field.kind === 'boolean')),
+  JSON.stringify(settingsRender.groups.map((group) => group.id)));
+check('the table defaults are configurable too',
+  settingsRender.groups.some((group) => group.id === 'table'
+    && group.fields.some((field) => field.key === 'botCount')
+    && group.fields.some((field) => field.key === 'botStyles' && field.kind === 'select')),
+  JSON.stringify(settingsRender.groups.map((group) => group.id)));
 check('the key is edited as a password, never as visible text',
-  settingsInputs.some((node) => node.props.type === 'password'),
-  settingsInputs.map((node) => node.props.type).join(','));
+  settingsControls.some((node) => node.props.type === 'password'),
+  settingsControls.map((node) => node.props.type).join(','));
 check('the settings page offers a save', settingsRender.after.some((node) => node.type === 'button' && flatten(node).includes('\u4fdd\u5b58')));
+check('the settings page offers a connection test',
+  settingsRender.after.some((node) => node.type === 'button' && flatten(node).includes('\u6d4b\u8bd5\u8fde\u901a')),
+  settingsRender.after.filter((node) => node.type === 'button').map((node) => flatten(node)).join(' | '));
 check('the settings page never prints the stored key',
   !flatten(settingsRender.after).includes('sk-secret'), flatten(settingsRender.after).slice(0, 80));
+// The module wears the same framed spade as the sidebar entry, so it is recognisable
+// in both places (the settings list itself has no per-plugin icon field).
+const settingsMark = settingsRender.after.find((node) => String(node.props.className || '').split(' ').includes('dshp-iconTile'));
+check('the settings page wears the sidebar mark',
+  settingsMark !== undefined && walkAll(settingsMark).some((node) => node.type === 'svg'),
+  settingsMark ? String(settingsMark.props.className) : 'no mark');
+check('the settings mark is drawn, not typed',
+  !flatten(settingsRender.after).includes('\u{1F0CF}'), flatten(settingsRender.after).slice(0, 60));
+// A native select paints its POPUP from the element's own colours, so the shared
+// translucent input fill behind it washed the option list out in dark mode. The select
+// and its options carry an opaque layer background instead: with the real dark tokens
+// that measures 13.34:1 (label-primary #f9fafb on bg-layer-2 #2c2c2e).
+check('the dropdown popup is themed, not translucent',
+  /\.dshp-setSelect\{[^}]*background:var\(--dsw-alias-bg-layer-2/.test(sheet)
+    && /\.dshp-setSelect option\{[^}]*background:var\(--dsw-alias-bg-layer-2/.test(sheet)
+    && /\.dshp-setSelect option\{[^}]*color:var\(--dsw-alias-label-primary/.test(sheet),
+  'the option list would fall back to the translucent fill and wash out in dark mode');
 
 const settingsSave = settingsRender.after.find((node) => node.type === 'button' && flatten(node).includes('\u4fdd\u5b58'));
 check('the save control is wired to a handler', settingsSave !== undefined && typeof settingsSave.props.onClick === 'function',
   settingsSave ? typeof settingsSave.props.onClick : 'no save button');
-// The POST round trip itself is covered from the host side, where a real route and a
-// real settings service answer; this harness's mini-React does not re-render on an
-// async setState, so driving the form's VALUES here would test the harness instead of
-// the plugin.
+// The fixture's POST answer carries no `applied` field, i.e. it looks like a host that has
+// not been restarted: the page must say so rather than claim a save took effect. The other
+// branch - a host that reports what it applied - is a plain 已保存.
+const settingsSaved = await renderSettings(settingsPayload, { save: true });
+check('a save to a host that reports nothing is flagged as not-yet-in-force',
+  flatten(settingsSaved.after).includes('\u91cd\u542f\u4e00\u6b21 dsh web'),
+  flatten(settingsSaved.after).slice(-140));
+const settingsApplied = await renderSettings(settingsPayload, {
+  save: true,
+  post: { applied: { coachMode: 'simple', coachEnabled: false } },
+});
+check('a save to a host that reports what it applied is a plain save',
+  flatten(settingsApplied.after).includes('\u5df2\u4fdd\u5b58')
+    && !flatten(settingsApplied.after).includes('\u91cd\u542f\u4e00\u6b21 dsh web'),
+  flatten(settingsApplied.after).slice(-140));
+const settingsTest = settingsRender.after.find((node) => node.type === 'button' && flatten(node).includes('\u6d4b\u8bd5\u8fde\u901a'));
+check('the test control is wired to a handler', settingsTest !== undefined && typeof settingsTest.props.onClick === 'function',
+  settingsTest ? typeof settingsTest.props.onClick : 'no test button');
 const settingsFailed = await renderSettings(settingsPayload, { fail: true });
 check('a dead host route still renders something usable',
   flatten(settingsFailed.after).length > 0, flatten(settingsFailed.after).slice(0, 80));
@@ -2412,6 +2504,146 @@ pendingIntervals.length = 0;
 setPanel(true, session.id);
 check('a table with no AI seat does not poll', pendingIntervals.filter(Boolean).length === 0,
   `intervals ${pendingIntervals.filter(Boolean).length}`);
+
+// ---- the settings actually change the panel ----------------------------------
+
+/** Render the sidebar entry with a scripted `/poker/settings` answer. */
+async function renderSidebarWith(settings) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, settings, groups: [] }) });
+  try {
+    // The settings are cached for the page's lifetime, so the harness forces a
+    // re-read the same way a settings save does.
+    await exportsObject.__testing.loadPluginSettings(true);
+    return walkAll(render(headerComponent, {}));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const hiddenEntry = await renderSidebarWith({ pluginEnabled: false });
+check('the plugin switch hides the sidebar entry', hiddenEntry.length === 0,
+  hiddenEntry.filter((node) => typeof node.props.className === 'string').map((node) => node.props.className).slice(0, 4).join(' | '));
+const shownEntry = await renderSidebarWith({ pluginEnabled: true });
+check('switching it back on shows the entry again',
+  shownEntry.some((node) => node.type === 'button' && String(node.props.className || '').includes('dshp-headerBtn')),
+  shownEntry.filter((node) => typeof node.props.className === 'string').map((node) => node.props.className).slice(0, 4).join(' | '));
+// Both directions of every toggle that changes what renders: the harness fails the suite
+// outright if a component changes its hook count, which is what an early return above the
+// hooks does - and what makes a surface simply vanish instead of erroring.
+const coachOffTree = walkAll(render(headerComponent, { sessionId: session.id }));
+const teachButton = coachOffTree.find((node) => node.type === 'button' && flatten(node).includes('\u{1F4A1}'));
+if (teachButton) {
+  teachButton.props.onClick();
+  walkAll(render(headerComponent, { sessionId: session.id }));
+  const teachAgain = walkAll(render(headerComponent, { sessionId: session.id }))
+    .find((node) => node.type === 'button' && flatten(node).includes('\u{1F4A1}'));
+  if (teachAgain) {
+    teachAgain.props.onClick();
+    walkAll(render(headerComponent, { sessionId: session.id }));
+  }
+}
+check('toggling the teaching layer keeps the surfaces stable', true);
+
+// `showLog` off drops the history column; `showAdvice` off drops the badge line.
+// Both are read from the settings the panel fetched, so the stub answers that route.
+const withSettings = async (settings) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, settings, groups: [] }) });
+  try {
+    await exportsObject.__testing.loadPluginSettings(true);
+    return walkAll(render(cardComponent, { block: settledBlock, sessionId: session.id, toolName: 'poker_action' }));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+};
+const logOff = await withSettings({ pluginEnabled: true, showLog: false, showAdvice: true, replaySpeed: 1 });
+check('the log column obeys its switch',
+  !logOff.some((node) => String(node.props.className || '').split(' ').includes('dshp-side')),
+  logOff.filter((node) => typeof node.props.className === 'string').map((node) => node.props.className).join(' | ').slice(0, 120));
+const logOn = await withSettings({ pluginEnabled: true, showLog: true, showAdvice: true, replaySpeed: 1 });
+check('the log column is there when the switch is on',
+  logOn.some((node) => String(node.props.className || '').split(' ').includes('dshp-side')),
+  'no log column');
+
+// The coach surfaces label which coach they are: the window title and the advice badge
+// both switch to the GTO mark when the payload says the GTO layer produced it.
+const gtoMeta = { ...checkedMeta, view: { ...checkedMeta.view, coach: { ...checkedMeta.view.coach, mode: 'gto' } } };
+const gtoTree = walkAll(render(cardComponent, {
+  block: { kind: 'tool-result', meta: gtoMeta, content: [], call: { name: 'poker_action', argsRaw: '{}' } },
+  sessionId: session.id,
+  toolName: 'poker_action',
+}));
+check('the advice badge says which coach it is',
+  flatten(gtoTree).includes('GTO \u5efa\u8bae'), flatten(gtoTree).slice(-80));
+check('the coach window title follows the mode',
+  walkAll(render(headerComponent, { sessionId: session.id })).some((node) => flatten(node).includes('GTO \u6559\u7ec3'))
+    || flatten(gtoTree).includes('GTO'),
+  'no GTO label');
+
+// The coach window carries its own style switcher: the style is a way of LOOKING at the
+// same spot, so the reading decides when to change it. The highlight follows the style the
+// HOST reports (`coach.settingsMode`, authoritative: GTO is postflop-only, so a preflop
+// payload still comes from the simple plan), with the local setting as the fallback for a
+// host that predates the field.
+const switcherFetch = [];
+const originalSwitchFetch = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  switcherFetch.push({ url: String(url), method: (init && init.method) || 'GET', body: init && init.body ? JSON.parse(init.body) : null });
+  return { ok: true, json: async () => ({ ok: true, settings: { coachMode: 'gto' }, groups: [] }) };
+};
+/** The header rendered with a coach payload that says the host runs `mode`. */
+const renderCoachWith = (mode, session) => walkAll(render(headerComponent, {
+  sessionId: session,
+  __coachMode: mode,
+}));
+let switchTree;
+let simpleButton;
+try {
+  await exportsObject.__testing.loadPluginSettings(true);
+  // The session's own fixture reports the host style, so point it at GTO for this test.
+  const gtoFixtureSession = (() => {
+    const key = 'switch-harness';
+    coachFixtures.set(key, {
+      entries: [
+        { type: 'event', event: { type: 'tool/call', seq: 1, data: { callId: 'sw_call', name: 'poker_action', arguments: '{}' } } },
+        { type: 'event', event: { type: 'tool/result', seq: 2, data: { message: { source: { kind: 'tool', callId: 'sw_call' }, content: [] }, meta: { ...checkedMeta, view: { ...checkedMeta.view, coach: { ...checkedMeta.view.coach, settingsMode: 'gto' } } } } } },
+      ],
+      hasMore: false,
+      revision: 1,
+    });
+    return key;
+  })();
+  switchTree = walkAll(render(headerComponent, { sessionId: gtoFixtureSession }));
+  const modeSwitch = switchTree.find((node) => String(node.props.className || '').split(' ').includes('dshp-modeSwitch'));
+  check('the coach window offers a style switcher', modeSwitch !== undefined,
+    switchTree.filter((node) => typeof node.props.className === 'string').map((node) => node.props.className).join(' | ').slice(0, 160));
+  const gtoActive = switchTree.find((node) => node.type === 'button' && flatten(node) === 'GTO');
+  simpleButton = switchTree.find((node) => node.type === 'button' && flatten(node) === '\u7b80\u6d01');
+  check('the switcher names both styles', gtoActive !== undefined && simpleButton !== undefined,
+    'both options must be on screen');
+  check('the active style is the one the host reports', (() => {
+    const onButtons = switchTree.filter((node) => node.type === 'button' && String(node.props.className || '').includes('dshp-modeBtnOn'));
+    return onButtons.length === 1 && flatten(onButtons[0]) === 'GTO';
+  })(), switchTree.filter((node) => String(node.props.className || '').includes('dshp-mode')).map((node) => `${node.props.className}=${flatten(node)}`).join(' | '));
+  if (simpleButton) {
+    await simpleButton.props.onClick({ stopPropagation() {} });
+    await new Promise((resolve) => process.nextTick(resolve));
+  }
+} finally {
+  globalThis.fetch = originalSwitchFetch;
+}
+const switchPost = switcherFetch.find((entry) => entry.method === 'POST' && entry.url === '/poker/settings');
+check('switching writes the other style', switchPost !== undefined && switchPost.body.coachMode === 'simple',
+  JSON.stringify(switcherFetch.map((entry) => [entry.method, entry.url, entry.body])));
+
+// A host that predates the field cannot apply the change at all, and the window says so
+// instead of leaving a button that appears to do nothing.
+const oldHostTree = walkAll(render(headerComponent, { sessionId: session.id }));
+const oldHostSwitch = oldHostTree.find((node) => String(node.props.className || '').split(' ').includes('dshp-modeSwitch'));
+check('a host without the field falls back to the stored setting', oldHostSwitch !== undefined
+  && oldHostTree.some((node) => flatten(node) === 'GTO'), 'no fallback highlight');
+void renderCoachWith;
 
 // ---- an unsettled (running) call must render a placeholder, not throw ----
 

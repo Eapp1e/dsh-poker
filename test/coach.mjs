@@ -10,6 +10,8 @@
 import { createGame, potTotal, startHand, advance, applyAction, legalActions } from '../lib/engine.js';
 import { decideBotAction } from '../lib/bots.js';
 import { coachFor, drawsFor, equityVsReads, madeHand, positionName, potMath, readOpponents } from '../lib/coach.js';
+import * as coachModule from '../lib/coach.js';
+import * as gto from '../lib/gto.js';
 
 let passed = 0;
 const failures = [];
@@ -334,6 +336,257 @@ check(
   barrelCoach.equity.equity + 1 < oneBetCoach.equity.equity,
   `barrel ${barrelCoach.equity.equity}% vs single ${oneBetCoach.equity.equity}%`,
 );
+
+// ---- the GTO layer --------------------------------------------------------
+
+// The indifference arithmetic is the part a player can check by hand, so it has to be
+// textbook: a pot-size bet means the caller needs 33%, the defender must continue 50%,
+// and the bettor's range is 2:1 value:bluff.
+const potBet = gto.indifference(100, 100);
+check('a pot bet needs 33% to call', Math.abs(potBet.required - 1 / 3) < 0.001, String(potBet.required));
+check('a pot bet means defending half the range', Math.abs(potBet.mdf - 0.5) < 0.001, String(potBet.mdf));
+check('a pot bet is 2:1 value to bluff', Math.abs(potBet.bluffShare - 1 / 3) < 0.001, String(potBet.bluffShare));
+check('alpha and MDF are complements', Math.abs(potBet.alpha + potBet.mdf - 1) < 0.001, `${potBet.alpha} + ${potBet.mdf}`);
+const halfBet = gto.indifference(100, 50);
+check('a half-pot bet needs 25% to call', Math.abs(halfBet.required - 0.25) < 0.001, String(halfBet.required));
+check('a half-pot bet means defending two thirds', Math.abs(halfBet.mdf - 2 / 3) < 0.001, String(halfBet.mdf));
+check('a half-pot bet bluffs a quarter of the time', Math.abs(halfBet.bluffShare - 0.25) < 0.001, String(halfBet.bluffShare));
+check('a tiny bet is nearly free to call', gto.indifference(1000, 1).required < 0.002, String(gto.indifference(1000, 1).required));
+
+// EV: folding is the zero, calling is equity x final pot minus the call, checking is
+// equity x pot, and a bet trades the pot against equity when called.
+const callEvs = gto.actionEvs({ pot: 100, toCall: 50, committed: 0, stack: 1000, equity: 0.5, foldEquity: 0.4, sizes: [] });
+check('folding is the zero reference', callEvs.find((entry) => entry.action === 'fold').ev === 0,
+  String(callEvs.find((entry) => entry.action === 'fold').ev));
+check('a coin flip getting 2:1 calls',
+  Math.abs(callEvs.find((entry) => entry.action === 'call').ev - (0.5 * 150 - 50)) < 0.001,
+  String(callEvs.find((entry) => entry.action === 'call').ev));
+const checkEvs = gto.actionEvs({ pot: 100, toCall: 0, committed: 0, stack: 1000, equity: 0.5, foldEquity: 0.4, sizes: [{ action: 'raise', amount: 50 }] });
+check('checking through is worth equity x pot',
+  Math.abs(checkEvs.find((entry) => entry.action === 'check').ev - 50) < 0.001,
+  JSON.stringify(checkEvs.map((entry) => [entry.action, entry.ev])));
+// A bet is worth: the pot when they fold, plus the called branch. The called branch prices a
+// TIGHTER range (the caller is not calling with everything) and the pot they actually build.
+check('a bet is worth fold equity plus the called branch', (() => {
+  const risk = 50;
+  const called = 100 + risk + 50; // pot + our risk + what they still owe
+  const discount = 0.03 + 0.35 * (risk / 1000); // scaled by the share of the stack committed
+  const value = (0.5 - discount) * called - risk;
+  const expected = 0.4 * 100 + 0.6 * value;
+  const actual = checkEvs.find((entry) => entry.action === 'raise').ev;
+  return Math.abs(actual - expected) < 0.5;
+})(), String(checkEvs.find((entry) => entry.action === 'raise').ev));
+check('a raise prices the pot the caller actually builds', (() => {
+  const evs = gto.actionEvs({ pot: 100, toCall: 100, committed: 0, stack: 1000, equity: 0.5, foldEquity: 0.5, sizes: [{ action: 'raise', amount: 250 }] });
+  const note = evs.find((entry) => entry.action === 'raise').note;
+  // 100 in the middle, we add 250, they add 150 to match: 500, not the 600 that
+  // `pot + 2*risk` invented.
+  return /500/.test(note) && !/600/.test(note);
+})(), JSON.stringify(gto.actionEvs({ pot: 100, toCall: 100, committed: 0, stack: 1000, equity: 0.5, foldEquity: 0.5, sizes: [{ action: 'raise', amount: 250 }] })));
+check('a raise over a bet gets less fold equity than a bet into checked players', (() => {
+  const facing = gto.actionEvs({ pot: 100, toCall: 100, committed: 100, stack: 1000, equity: 0.5, foldEquity: 0.6, raiseFoldEquity: 0.3, sizes: [{ action: 'raise', amount: 300 }] });
+  return /弃牌率 30%/.test(facing.find((entry) => entry.action === 'raise').note);
+})(), 'the raise must use raiseFoldEquity');
+check('zero fold equity makes a zero-equity bet lose its own size', (() => {
+  const evs = gto.actionEvs({ pot: 100, toCall: 0, committed: 0, stack: 1000, equity: 0, foldEquity: 0, sizes: [{ action: 'raise', amount: 50 }] });
+  return Math.abs(evs.find((entry) => entry.action === 'raise').ev + 50) < 0.001;
+})(), 'a hopeless bet should cost exactly what it risks');
+check('a bet beyond the stack is not priced', gto.actionEvs({
+  pot: 100, toCall: 0, committed: 0, stack: 40, equity: 0.9, foldEquity: 0.5, sizes: [{ action: 'raise', amount: 500 }],
+}).length === 1, 'an illegal size was priced');
+
+// The mix is over LINES, not over four sizes of the same line.
+const lineEvs = gto.actionEvs({ pot: 100, toCall: 0, committed: 0, stack: 1000, equity: 0.7, foldEquity: 0.5,
+  sizes: [{ action: 'raise', amount: 33 }, { action: 'raise', amount: 50 }, { action: 'raise', amount: 75 }] });
+const mixed = gto.mixFrom(gto.bestPerLine(lineEvs), 10);
+check('the mix collapses sizes into lines',
+  mixed.length === 2 && mixed.every((entry) => entry.line === 'bet' || entry.line === 'check'),
+  JSON.stringify(mixed.map((entry) => [entry.line, entry.share])));
+check('the mix sums to one', Math.abs(mixed.reduce((sum, entry) => sum + entry.share, 0) - 1) < 0.001,
+  JSON.stringify(mixed.map((entry) => entry.share)));
+check('the best line takes the bulk', mixed[0].share > 0.5, JSON.stringify(mixed.map((entry) => entry.share)));
+check('a clear winner is not diluted', (() => {
+  const wide = gto.mixFrom(gto.bestPerLine(gto.actionEvs({ pot: 100, toCall: 0, committed: 0, stack: 1000, equity: 0.99, foldEquity: 0.9,
+    sizes: [{ action: 'raise', amount: 100 }] })), 5);
+  return wide[0].share > 0.9;
+})(), 'a strong line should dominate the mix');
+
+// A per-opponent fold rate is not a take-down rate.
+check('two opponents folding 60% each take it down 36%', Math.abs(coachModule.takeDownProbability(0.6, 2) - 0.36) < 0.001,
+  String(coachModule.takeDownProbability(0.6, 2)));
+check('one opponent folding 60% takes it down 60%', Math.abs(coachModule.takeDownProbability(0.6, 1) - 0.6) < 0.001,
+  String(coachModule.takeDownProbability(0.6, 1)));
+check('a five-way flop needs everyone to fold', coachModule.takeDownProbability(0.6, 5) < 0.1,
+  String(coachModule.takeDownProbability(0.6, 5)));
+
+// The roles, which is what turns "I have a pair" into "I am at the top of my range".
+check('a set is a value hand', gto.handRole({ equity: 0.9, outs: 0, made: { label: '三条' } }).id === 'value');
+check('a flush draw with 9 outs is a semi-bluff', gto.handRole({ equity: 0.35, outs: 9, made: { label: '高牌' } }).id === 'semibluff');
+check('a mid pair facing a bet is a bluff-catcher', gto.handRole({ equity: 0.4, outs: 0, made: { label: '中对' }, facingBet: true }).id === 'bluffcatcher');
+check('nothing is air', gto.handRole({ equity: 0.12, outs: 0, made: { label: '高牌' } }).id === 'air');
+
+// The whole layer, on a real spot: the plan comes from the EV table, the sections carry
+// the arithmetic, and the mode is reported so a surface can label itself.
+const gtoSpot = handState({
+  board: ['Kh', '5c', '9s'],
+  street: 'flop',
+  currentBet: 300,
+  players: [
+    { seat: 0, name: '玩家', cards: ['Ac', '8c'], streetCommitted: 100, handCommitted: 200, stack: 9000 },
+    { seat: 1, name: '石头', style: 'tag', cards: ['Ks', 'Qd'], streetCommitted: 300, handCommitted: 400, stack: 9000 },
+  ],
+  actorSeat: 0,
+});
+const gtoCoach = coachFor(gtoSpot, 0, { mode: 'gto', iterations: 200 });
+const simpleCoach = coachFor(gtoSpot, 0, { mode: 'simple', iterations: 200 });
+check('the coach reports which mode produced it', gtoCoach.mode === 'gto' && simpleCoach.mode === 'simple',
+  `${gtoCoach.mode} / ${simpleCoach.mode}`);
+check('GTO mode adds its two sections',
+  gtoCoach.sections.some((section) => section.id === 'gto') && gtoCoach.sections.some((section) => section.id === 'range'),
+  gtoCoach.sections.map((section) => section.id).join(','));
+check('simple mode does not', !simpleCoach.sections.some((section) => section.id === 'gto'),
+  simpleCoach.sections.map((section) => section.id).join(','));
+check('the GTO numbers travel as data',
+  gtoCoach.gto && gtoCoach.gto.mode === 'gto' && Number.isFinite(gtoCoach.gto.mdf) && gtoCoach.gto.ev.length > 0,
+  JSON.stringify(gtoCoach.gto && { mdf: gtoCoach.gto.mdf, ev: gtoCoach.gto.ev }));
+check('the GTO plan is the max-EV line',
+  gtoCoach.gto.ev.every((entry, index, list) => index === 0 || entry.ev <= list[0].ev),
+  JSON.stringify(gtoCoach.gto.ev));
+check('the maths section quotes the indifference numbers',
+  gtoCoach.sections.find((section) => section.id === 'gto').lines.some((line) => /MDF|防线/.test(line)),
+  gtoCoach.sections.find((section) => section.id === 'gto').lines.join(' | ').slice(0, 120));
+check('the brief says it is the GTO coach', /GTO/.test(gtoCoach.brief), gtoCoach.brief.slice(0, 60));
+check('the plan headline names a concrete line',
+  typeof gtoCoach.plan.headline === 'string' && gtoCoach.plan.headline.length > 0, gtoCoach.plan.headline);
+check('the plan carries the range role', gtoCoach.plan.role !== undefined && gtoCoach.plan.role !== null, String(gtoCoach.plan.role));
+
+// Preflop gets the GTO layer too. Leaving it out was the bug a player hit: most decisions
+// ARE preflop, so switching the style appeared to do nothing at all.
+const preflopGto = coachFor(sixMax, 0, { mode: 'gto', iterations: 100 });
+const preflopSimple = coachFor(sixMax, 0, { mode: 'simple', iterations: 100 });
+check('preflop gets a GTO plan as well', preflopGto.mode === 'gto' && preflopGto.gto !== null,
+  `${preflopGto.mode} / ${Boolean(preflopGto.gto)}`);
+check('the preflop GTO plan is a different plan',
+  preflopGto.plan.headline !== preflopSimple.plan.headline,
+  `${preflopGto.plan.headline} vs ${preflopSimple.plan.headline}`);
+check('the preflop GTO sections are there',
+  preflopGto.sections.some((section) => section.id === 'gto') && preflopGto.sections.some((section) => section.id === 'range'),
+  preflopGto.sections.map((section) => section.id).join(','));
+check('the preflop numbers name the range position',
+  preflopGto.gto.street === 'preflop' && Number.isFinite(preflopGto.gto.topShare) && typeof preflopGto.gto.role === 'string',
+  JSON.stringify({ street: preflopGto.gto.street, top: preflopGto.gto.topShare, role: preflopGto.gto.role }));
+check('preflop says there is no MDF to speak of',
+  preflopGto.gto.mdf === null
+    && preflopGto.sections.find((section) => section.id === 'gto').lines.some((line) => /MDF/.test(line)),
+  JSON.stringify(preflopGto.gto.mdf));
+check('the preflop EV table has lines to compare',
+  preflopGto.gto.ev.length >= 2 && preflopGto.gto.ev.every((entry, index, list) => index === 0 || entry.ev <= list[0].ev),
+  JSON.stringify(preflopGto.gto.ev));
+const preflopMenu = { canRaise: true, canAllIn: true, toCall: 100, minRaiseTo: 200, maxRaiseTo: 10000 };
+check('preflop sizes are quoted in big blinds, not pot fractions',
+  gto.priceSizes(preflopMenu, 150, 100, 'preflop').some((entry) => entry.amount === 250)
+    && gto.priceSizes(preflopMenu, 150, 100, 'preflop').some((entry) => entry.amount === 300),
+  JSON.stringify(gto.priceSizes(preflopMenu, 150, 100, 'preflop')));
+const flopMenu = { canRaise: true, canAllIn: false, toCall: 0, minRaiseTo: 50, maxRaiseTo: 10000 };
+check('a postflop size menu is still pot-relative',
+  gto.priceSizes(flopMenu, 400, 100, 'flop').some((entry) => entry.amount === 200),
+  JSON.stringify(gto.priceSizes(flopMenu, 400, 100, 'flop')));
+
+// The rules that keep the recommendation honest. These exist because the first version
+// mixed a -40 line at 30% and folded hands the range opens - "the strategy has big
+// problems", reported from the table.
+const band = gto.equivalenceBand(150, 100);
+check('the equivalence band is small', band <= 20 && band >= 9, String(band));
+const losingLines = [
+  { line: 'fold', action: 'fold', amount: 0, ev: 0 },
+  { line: 'bet', action: 'raise', amount: 250, ev: -40 },
+  { line: 'call', action: 'call', amount: 100, ev: -44 },
+];
+check('a clearly losing line is never recommended while folding is free',
+  gto.pickLine(losingLines, { pot: 150, bigBlind: 100 }).line === 'fold',
+  JSON.stringify(gto.pickLine(losingLines, { pot: 150, bigBlind: 100 })));
+check('a line far outside the band is never given a share', (() => {
+  const mixed = gto.mixFrom(losingLines, band);
+  return mixed[0].share === 1 && mixed.slice(1).every((entry) => entry.share === 0);
+})(), JSON.stringify(gto.mixFrom(losingLines, band).map((entry) => [entry.line, entry.share])));
+const equivalentLines = [
+  { line: 'fold', action: 'fold', amount: 0, ev: 0 },
+  { line: 'bet', action: 'raise', amount: 250, ev: -5 },
+];
+check('the range plan breaks a genuine tie', (() => {
+  const chosen = gto.pickLine(equivalentLines, { pot: 150, bigBlind: 100, preferred: 'bet' });
+  return chosen.line === 'bet';
+})(), JSON.stringify(gto.pickLine(equivalentLines, { pot: 150, bigBlind: 100, preferred: 'bet' })));
+check('without a preference the tie still folds', (() => {
+  const chosen = gto.pickLine(equivalentLines, { pot: 150, bigBlind: 100, preferred: null });
+  return chosen.line === 'fold';
+})(), JSON.stringify(gto.pickLine(equivalentLines, { pot: 150, bigBlind: 100, preferred: null })));
+check('a tie-break is presented as one plan, not a fake mix', (() => {
+  const mixed = gto.mixFrom(equivalentLines, band);
+  const chosen = gto.pickLine(mixed, { pot: 150, bigBlind: 100, preferred: 'bet' });
+  const shown = gto.presentMix(mixed, chosen, true);
+  return shown[0].line === 'bet' && shown[0].share === 1 && shown[1].share === 0;
+})(), JSON.stringify(gto.presentMix(gto.mixFrom(equivalentLines, band), equivalentLines[0], true)));
+check('a real mix keeps its shares and leads with the choice', (() => {
+  const mixed = gto.mixFrom(equivalentLines, band);
+  const shown = gto.presentMix(mixed, mixed[0], false);
+  return Math.abs(shown.reduce((sum, entry) => sum + entry.share, 0) - 1) < 0.001;
+})(), JSON.stringify(gto.presentMix(gto.mixFrom(equivalentLines, band), equivalentLines[0], false)));
+
+// End to end: a hand the range opens must be opened, not folded, even when the one-street
+// EV calls it a coin flip. This is the exact case a player reported.
+const buttonTop21 = handState({
+  street: 'preflop',
+  currentBet: 100,
+  players: [
+    { seat: 0, name: '玩家', cards: ['Qd', '9d'], streetCommitted: 0, handCommitted: 0, stack: 10000 },
+    { seat: 1, name: '大盲', style: 'tag', cards: ['??', '??'], streetCommitted: 100, handCommitted: 100, stack: 9900 },
+  ],
+  actorSeat: 0,
+  buttonSeat: 0,
+  smallBlindSeat: 0,
+  bigBlindSeat: 1,
+});
+const buttonCoach = coachFor(buttonTop21, 0, { mode: 'gto', iterations: 200 });
+check('a playable hand on the button is opened, not folded',
+  buttonCoach.gto && buttonCoach.gto.role !== 'trash' && /开池|下注到|\u52a0\u6ce8/.test(buttonCoach.plan.headline),
+  `${buttonCoach.plan.headline} | top${buttonCoach.gto && buttonCoach.gto.topShare} | ${buttonCoach.gto && buttonCoach.gto.role}`);
+check('only EV-equivalent lines get a share of the mix',
+  buttonCoach.gto.ev.every((entry, index, list) => entry.share === 0 || list[0].ev - entry.ev <= gto.equivalenceBand(150, 100)),
+  JSON.stringify(buttonCoach.gto.ev));
+
+// The screenshot case: two pair facing a huge shove. The coach recommended a 208BB re-raise
+// because it priced the raise with the table's fold-to-a-bet rate - against a player who is
+// already all-in and cannot fold. There is no raise here, only call or fold.
+const facingShove = handState({
+  board: ['Jd', 'Th', 'Tc', '7d'],
+  street: 'turn',
+  currentBet: 20600,
+  lastRaiseSize: 18200,
+  bigBlind: 1200,
+  smallBlind: 600,
+  players: [
+    { seat: 0, name: '玩家', cards: ['Kc', 'Jh'], streetCommitted: 2400, handCommitted: 10400, stack: 18450 },
+    { seat: 1, name: '石头', style: 'rock', cards: ['??', '??'], streetCommitted: 20600, handCommitted: 20600, stack: 0, allIn: true },
+  ],
+  actorSeat: 0,
+});
+const shoveCoach = coachFor(facingShove, 0, { mode: 'gto', iterations: 300 });
+check('an all-in opponent leaves only call or fold',
+  shoveCoach.gto.ev.length === 2
+    && shoveCoach.gto.ev.every((entry) => entry.action === 'call' || entry.action === 'fold'),
+  JSON.stringify(shoveCoach.gto.ev));
+check('the recommendation is not a raise', !/加注|下注|全下/.test(shoveCoach.plan.headline),
+  shoveCoach.plan.headline);
+check('the fold equity is zero against an all-in', shoveCoach.gto.foldEquity === 0, String(shoveCoach.gto.foldEquity));
+check('the section explains why there is no raise',
+  shoveCoach.sections.find((section) => section.id === 'gto').lines.some((line) => /只有跟或弃/.test(line)),
+  shoveCoach.sections.find((section) => section.id === 'gto').lines.join(' | ').slice(-160));
+// Required equity for a call is bet / (pot + 2 x bet), where the pot is what the hand has
+// put in so far (10,400 + 20,600 here), not the rounded figure the panel shows.
+check('the call is priced against the shove',
+  shoveCoach.gto.required !== null && Math.abs(shoveCoach.gto.required - 18200 / (31000 + 2 * 18200)) < 0.01,
+  `${shoveCoach.gto.required} vs ${18200 / (31000 + 2 * 18200)}`);
 
 if (failures.length > 0) {
   console.error(`FAIL: ${failures.length} of ${passed + failures.length} checks failed`);
