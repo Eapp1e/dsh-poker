@@ -826,10 +826,15 @@ check('the settings page is told the installed version',
 check('the version also arrives as an info field',
   (settingsWithVersion.json.groups || []).some((group) => group.fields.some((field) => field.kind === 'info' && /^v\d/.test(String(field.value)))),
   JSON.stringify((settingsWithVersion.json.groups || []).map((group) => group.id)));
-check('the about group carries the release action',
+check('the about group carries the update action',
   (settingsWithVersion.json.groups || []).some((group) => group.id === 'about'
-    && group.fields.some((field) => field.kind === 'action' && field.action === 'update-check')),
+    && group.fields.some((field) => field.kind === 'action' && field.action === 'update-apply')),
   JSON.stringify((settingsWithVersion.json.groups || []).find((group) => group.id === 'about')));
+// The manual "check now" row is gone: the check runs on page load by itself, and the update
+// button re-checks (past the cache) when there is nothing newer.
+check('there is no separate check-now row',
+  !(settingsWithVersion.json.groups || []).some((group) => group.fields.some((field) => field.action === 'update-check')),
+  JSON.stringify((settingsWithVersion.json.groups || []).flatMap((group) => group.fields.map((field) => field.action)).filter(Boolean)));
 
 /** A GitHub API double: answers by URL pattern. */
 const githubDouble = (handlers) => async (url) => {
@@ -973,6 +978,107 @@ check('switching back changes the live table too',
   backAgain.json.view.coach.mode === 'simple'
     && !backAgain.json.view.coach.sections.some((section) => section.id === 'gto'),
   String(backAgain.json.view.coach.mode));
+
+// ── 点击更新: the update itself ────────────────────────────────────────────
+
+check('the package manager follows the lock file',
+  updateModule.pickPackageManager(['pnpm-lock.yaml', 'package-lock.json']) === 'pnpm'
+    && updateModule.pickPackageManager(['yarn.lock']) === 'yarn'
+    && updateModule.pickPackageManager(['package-lock.json']) === 'npm'
+    && updateModule.pickPackageManager([]) === 'npm',
+  JSON.stringify([
+    updateModule.pickPackageManager(['pnpm-lock.yaml']),
+    updateModule.pickPackageManager(['yarn.lock']),
+    updateModule.pickPackageManager([]),
+  ]));
+check('the install command is argv, not a shell string',
+  JSON.stringify(updateModule.installArgv('npm', 'dsh-plugin-poker', '1.2.3')) === JSON.stringify(['npm', ['install', 'dsh-plugin-poker@1.2.3', '--no-audit', '--no-fund']])
+    && updateModule.installArgv('pnpm', 'p', '2.0.0')[0] === 'pnpm',
+  JSON.stringify(updateModule.installArgv('npm', 'dsh-plugin-poker', '1.2.3')));
+
+/** Run applyUpdate against a stubbed GitHub and a stubbed package manager. */
+const updateWith = (options) => updateModule.applyUpdate({
+  current: '0.1.0',
+  repo: 'Eapp1e/dsh-poker',
+  packageName: 'dsh-plugin-poker',
+  installRoot: '/tmp/install',
+  manager: 'npm',
+  ...options,
+});
+const releaseStub = (tag) => async () => ({ ok: true, status: 200, json: async () => ({ tag_name: tag }) });
+
+const nothingToDo = await updateWith({ fetchImpl: releaseStub('v0.1.0'), run: async () => { throw new Error('must not run'); } });
+check('an up-to-date install does not run anything',
+  nothingToDo.ok === true && nothingToDo.updated === false && /已是最新/.test(nothingToDo.lines.join(' ')),
+  JSON.stringify(nothingToDo));
+
+let ran = null;
+const didUpdate = await updateWith({
+  fetchImpl: releaseStub('v9.9.9'),
+  run: async (options) => {
+    ran = options;
+    return { code: 0, stdout: 'added 1 package in 3s', stderr: '' };
+  },
+});
+check('an update runs the package manager in the install root',
+  ran !== null && ran.command === 'npm' && ran.cwd === '/tmp/install'
+    && ran.args.includes('dsh-plugin-poker@9.9.9'),
+  JSON.stringify(ran));
+check('a successful update reports both versions',
+  didUpdate.ok === true && didUpdate.updated === true && didUpdate.version === '9.9.9'
+    && /0\.1\.0/.test(didUpdate.lines.join(' ')) && /9\.9\.9/.test(didUpdate.lines.join(' ')),
+  JSON.stringify(didUpdate.lines));
+
+const failedUpdate = await updateWith({
+  fetchImpl: releaseStub('v9.9.9'),
+  run: async () => ({ code: 1, stdout: '', stderr: 'EACCES: permission denied' }),
+});
+check('a failed update explains itself and offers the manual command',
+  failedUpdate.ok === false && failedUpdate.updated === false
+    && /EACCES/.test(failedUpdate.lines.join(' ')) && /手动升级/.test(failedUpdate.lines.join(' ')),
+  JSON.stringify(failedUpdate.lines));
+
+// This package is not on npm, so a git checkout must update by pulling - `npm install` there
+// would 404 instead of updating anything.
+let gitRan = null;
+const gitUpdate = await updateWith({
+  fetchImpl: releaseStub('v9.9.9'),
+  gitRoot: '/tmp/checkout',
+  run: async (options) => {
+    gitRan = options;
+    return { code: 0, stdout: 'Already up to date.', stderr: '' };
+  },
+});
+check('a git checkout updates by pulling',
+  gitRan !== null && gitRan.command === 'git' && gitRan.args.join(' ') === '-C /tmp/checkout pull --ff-only'
+    && gitUpdate.ok === true && gitUpdate.via === 'git',
+  JSON.stringify({ ran: gitRan, result: gitUpdate.lines }));
+
+// A tag that sorts ABOVE the installed version but is not a version number npm would take.
+// (A tag that sorts below is simply "not newer"; a prerelease like 1.0.0-beta.1 is valid and
+// is allowed through.)
+const badTag = await updateWith({ fetchImpl: releaseStub('v1.2.3.4.5'), run: async () => { throw new Error('must not run'); } });
+check('a tag that is not a version is refused before anything runs',
+  badTag.ok === false && /不像版本号/.test(badTag.lines.join(' ')), JSON.stringify(badTag.lines));
+check('a real prerelease tag is allowed through',
+  updateModule.installArgv('npm', 'dsh-plugin-poker', '1.0.0-beta.1')[1].includes('dsh-plugin-poker@1.0.0-beta.1'),
+  JSON.stringify(updateModule.installArgv('npm', 'dsh-plugin-poker', '1.0.0-beta.1')));
+
+const noRunner = await updateWith({ fetchImpl: releaseStub('v9.9.9') });
+check('without a runner the answer is the manual command',
+  noRunner.ok === false && /手动升级/.test(noRunner.lines.join(' ')), JSON.stringify(noRunner.lines));
+
+// The route itself: an up-to-date install answers without spawning anything, which is also
+// what makes this test safe to run.
+try {
+  globalThis.fetch = releaseStub(`v${settingsWithVersion.json.version}`);
+  const routeUpToDate = await request('POST', '/poker/update-apply', {});
+  check('the update route answers when there is nothing to do',
+    routeUpToDate.status === 200 && routeUpToDate.json.result.updated === false,
+    JSON.stringify(routeUpToDate.json).slice(0, 200));
+} finally {
+  globalThis.fetch = realFetch;
+}
 
 // ── dispose contract ───────────────────────────────────────────────────────
 

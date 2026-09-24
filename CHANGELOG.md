@@ -6,8 +6,35 @@ All notable changes to this plugin are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Three layout corrections on the settings page.** The ⓘ marker is gone - the tooltip is on the row
+  itself, which needs no decoration; the connection test moved out of the footer and into the AI group
+  as an ordinary action field (it tests THAT configuration, including a key typed but not saved); and
+  "保存后立即生效" moved from a paragraph under the title to the line beside the 保存 button it is
+  actually about. The test button is now declared in `lib/settings.js` like everything else, so the
+  client gained no special case for it.
+- **The settings page stopped printing its own manual.** Every row's explanation now lives in a
+  tooltip on the row itself (with a small ⓘ so it is discoverable) instead of a permanent line of grey
+  text under it, and the header is one short sentence. The update row is status-first, the way a plugin
+  market reads: it states `已是最新版本（v0.1.0）` / `有新版本 v0.2.0（当前 v0.1.0）` /
+  `暂时查不到最新版本` as text, offers the **更新到 v0.2.0** button only when pressing it would change
+  something, adds a **本次忽略** that silences the prompt (and the entry's dot) for the session, and
+  keeps a quiet **重新检查** link for the up-to-date case.
+
 ### Added
 
+- **The release check is automatic, and the update is one click.** The check now runs on page load
+  (once per window; the host caches the answer for ten minutes), a new release shows as a small dot on
+  the sidebar entry, and the settings page offers a real **更新** button: it pulls a git checkout
+  (`git -C <dir> pull --ff-only`) or runs the package manager the lock file implies, installing the
+  exact version the release page reported. It asks for confirmation first, prints the command's output
+  next to the button, and on failure hands over the real error plus the manual command and the release
+  link. Nothing about the run is page-controlled - package, version and directory all come from the
+  host, and the version must pass a strict pattern - so a page can only ever ask for "the newest
+  release of this repository". The separate "check now" row is gone: the check runs by itself, and the
+  update button re-checks (past the ten-minute cache) when there is nothing newer - one control whose
+  meaning is always true, instead of two that overlap.
 - **The coach style applies on change, and says so when it cannot.** The `coachMode` select no longer
   waits for 保存 (a style is nothing to review), and both it and the coach window's switcher now
   VERIFY the change: the settings route reports the style the host is actually running, so a click

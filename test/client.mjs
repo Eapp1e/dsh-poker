@@ -343,6 +343,9 @@ const hostPlugin = await import('../lib/index.js');
 const fetchRequests = [];
 let failFetch = false;
 let lastRouteAnswer = null;
+/** Every route answer, by path: "the last answer" is ambiguous once the plugin also posts
+ *  to its own update routes on its own. */
+const routeAnswers = [];
 // One-shot override: a stand-in answer for the NEXT matching route call, used to
 // play the part of a host that predates a feature (see the stale-host test).
 let fetchOverride = null;
@@ -378,20 +381,35 @@ function fakeHttpResponse() {
 globalThis.fetch = async (url, options) => {
   const body = options && options.body ? JSON.parse(options.body) : undefined;
   fetchRequests.push({ url, method: (options && options.method) || 'GET', body });
+  // `lastRouteAnswer` means "the last answer that carried a table": the plugin also posts to
+  // its own update routes on its own (the automatic release check), and one of those landing
+  // last made every fixture read an answer with no table in it.
+  const remember = (answer) => {
+    if (answer && answer.view) lastRouteAnswer = answer;
+  };
   if (failFetch) throw new Error('route unavailable');
   if (fetchOverride !== null) {
     const answer = fetchOverride(url, body);
     if (answer !== undefined && answer !== null) {
-      lastRouteAnswer = answer;
+      remember(answer);
       return { status: 200, ok: true, json: async () => answer };
     }
   }
   const response = fakeHttpResponse();
   await hostPlugin.handlePokerRequest(fakeHttpRequest((options && options.method) || 'GET', url, body), response);
   const settled = response.settle();
-  lastRouteAnswer = settled.json;
+  remember(settled.json);
+  routeAnswers.push({ path: String(url), answer: settled.json });
   return { status: settled.status, ok: settled.status === 200, json: async () => settled.json };
 };
+
+/** The last answer from a specific route, which is what a fixture usually means. */
+function answerFor(path) {
+  for (let index = routeAnswers.length - 1; index >= 0; index -= 1) {
+    if (routeAnswers[index].path === path) return routeAnswers[index].answer;
+  }
+  return null;
+}
 
 // ---- activate against a fake slot registry ----
 
@@ -1488,11 +1506,14 @@ const actionButton = cardButtons.find((button) => /\u8fc7\u724c|\u8ddf\u6ce8|\u4
 check('the card offers action buttons', cardButtons.length >= 2, `got ${cardButtons.length}`);
 check('the card offers a legal action for the hero turn', actionButton !== undefined, cardText.slice(0, 200));
 const revisionBefore = checkedMeta.view.revision;
+// Only the ACTION route matters here: the plugin also posts to its own update routes on its
+// own (the automatic release check), which is real behaviour but not this fixture's subject.
+const actionCalls = () => fetchRequests.filter((entry) => entry.url === '/poker/action');
 if (actionButton) await actionButton.props.onClick();
 check('clicking never posts a chat message', submitted === null, JSON.stringify(submitted));
-check('clicking calls the plugin route instead', fetchRequests.length === 1 && fetchRequests[0].url.startsWith('/poker/'), JSON.stringify(fetchRequests.map((entry) => entry.url)));
-check('the route call carries the opaque table id', fetchRequests.length === 1 && fetchRequests[0].body.tableId === checkedMeta.view.tableId, JSON.stringify(fetchRequests[0] && fetchRequests[0].body));
-check('the route call names one action', fetchRequests.length === 1 && typeof fetchRequests[0].body.action === 'string', JSON.stringify(fetchRequests[0] && fetchRequests[0].body));
+check('clicking calls the plugin route instead', actionCalls().length === 1, JSON.stringify(fetchRequests.map((entry) => entry.url)));
+check('the route call carries the opaque table id', actionCalls().length === 1 && actionCalls()[0].body.tableId === checkedMeta.view.tableId, JSON.stringify(actionCalls()[0] && actionCalls()[0].body));
+check('the route call names one action', actionCalls().length === 1 && typeof actionCalls()[0].body.action === 'string', JSON.stringify(actionCalls()[0] && actionCalls()[0].body));
 
 // ---- the opponents' moves are REPLAYED, not jumped over --------------------
 
@@ -1523,8 +1544,9 @@ check('the replay queue drains', pendingTimers.length === 0, `still queued ${pen
 const settled = render(cardComponent, { block: settledBlock, sessionId: session.id, toolName: 'poker_action' });
 const settledText = flatten(settled);
 check('the replay ends on the authoritative state', !/\u5bf9\u624b\u884c\u52a8\u4e2d/.test(settledText), settledText.slice(-160));
-check('the replay lands the real revision', lastRouteAnswer !== null && lastRouteAnswer.view.revision > revisionBefore, `${revisionBefore} -> ${lastRouteAnswer && lastRouteAnswer.view.revision}`);
-check('the settled table shows the pot it ended on', settledText.includes(Number(lastRouteAnswer.view.pot).toLocaleString('en-US')), `expected ${lastRouteAnswer.view.pot}`);
+const actionAnswer = answerFor('/poker/action') || lastRouteAnswer;
+check('the replay lands the real revision', actionAnswer !== null && actionAnswer.view.revision > revisionBefore, `${revisionBefore} -> ${actionAnswer && actionAnswer.view && actionAnswer.view.revision}`);
+check('the settled table shows the pot it ended on', settledText.includes(Number(actionAnswer.view.pot).toLocaleString('en-US')), `expected ${actionAnswer.view.pot}`);
 
 // The click really advanced the engine: re-render and read the newer state.
 const afterClick = settled;
@@ -2369,6 +2391,14 @@ async function renderSettings(settings, options = {}) {
         after = walkAll(render(settingsRegistration.component, {}));
       }
     }
+    if (options.clickTest === true) {
+      const button = after.find((node) => node.type === 'button' && flatten(node).includes('\u6d4b\u8bd5\u8fde\u901a'));
+      if (button) await button.props.onClick();
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await new Promise((resolve) => process.nextTick(resolve));
+        after = walkAll(render(settingsRegistration.component, {}));
+      }
+    }
     return { after, requests, groups, view };
   } finally {
     globalThis.fetch = originalFetch;
@@ -2408,11 +2438,17 @@ check('an info field is part of the schema', infoField !== undefined && infoFiel
   JSON.stringify(infoField));
 check('the installed version is on the page', flatten(settingsRender.after).includes('v0.1.0'),
   flatten(settingsRender.after).slice(-160));
-const actionField = settingsRender.groups.flatMap((group) => group.fields).find((field) => field.kind === 'action');
-check('an action field names the op it runs', actionField !== undefined && actionField.action === 'update-check',
-  JSON.stringify(actionField));
-check('the action field is not a settings control',
-  !settingsControls.some((node) => node.props.value === 'update-check' || node.props.value === 'updateCheck'),
+const actionFields = settingsRender.groups.flatMap((group) => group.fields).filter((field) => field.kind === 'action');
+check('action fields name the op they run',
+  actionFields.length === 2
+    && actionFields.some((field) => field.action === 'settings-test')
+    && actionFields.some((field) => field.action === 'update-apply'),
+  JSON.stringify(actionFields.map((field) => [field.key, field.action])));
+check('the connection test lives with the AI fields, not in the footer',
+  settingsRender.groups.find((group) => group.id === 'ai').fields.some((field) => field.action === 'settings-test'),
+  JSON.stringify(settingsRender.groups.map((group) => [group.id, group.fields.filter((field) => field.kind === 'action').map((field) => field.key)])));
+check('the action fields are not settings controls',
+  !settingsControls.some((node) => String(node.props.value || '').includes('Test') || String(node.props.value || '').includes('Apply')),
   'an action field leaked into the inputs');
 check('every group is titled', settingsRender.groups.every((group) => flatten(settingsRender.after).includes(group.label)),
   settingsRender.groups.map((group) => group.label).join(', '));
@@ -2474,6 +2510,19 @@ check('a save to a host that reports what it applied is a plain save',
 const settingsTest = settingsRender.after.find((node) => node.type === 'button' && flatten(node).includes('\u6d4b\u8bd5\u8fde\u901a'));
 check('the test control is wired to a handler', settingsTest !== undefined && typeof settingsTest.props.onClick === 'function',
   settingsTest ? typeof settingsTest.props.onClick : 'no test button');
+// It now lives in the AI group, so the click has to send THIS form (including a key typed but
+// not saved) to the probe route and print the timing it gets back.
+const settingsProbed = await renderSettings(settingsPayload, {
+  clickTest: true,
+  post: { result: { ok: true, ms: 382, model: 'test-model', reply: 'pong' } },
+});
+const probeCall = settingsProbed.requests.find((entry) => entry.url === '/poker/settings-test');
+check('the connection test posts the form it sits in',
+  probeCall !== undefined && probeCall.method === 'POST' && probeCall.body.aiModel === 'test-model',
+  JSON.stringify(settingsProbed.requests.map((entry) => [entry.method, entry.url])));
+check('the probe result is printed next to the button',
+  /\u2705 \u8fde\u901a\uff1a382ms/.test(flatten(settingsProbed.after)),
+  flatten(settingsProbed.after).slice(-160));
 const settingsFailed = await renderSettings(settingsPayload, { fail: true });
 check('a dead host route still renders something usable',
   flatten(settingsFailed.after).length > 0, flatten(settingsFailed.after).slice(0, 80));
@@ -2644,6 +2693,167 @@ const oldHostSwitch = oldHostTree.find((node) => String(node.props.className || 
 check('a host without the field falls back to the stored setting', oldHostSwitch !== undefined
   && oldHostTree.some((node) => flatten(node) === 'GTO'), 'no fallback highlight');
 void renderCoachWith;
+
+// ---- the automatic release check and the update button --------------------
+
+// The check runs ONCE per page load, on the always-mounted entry, so a new release is known
+// before the settings are ever opened; the answer drives a dot on the entry and the update
+// button on the settings page.
+const updateFetch = [];
+const originalUpdateFetch = globalThis.fetch;
+const originalConfirm = globalThis.confirm;
+globalThis.fetch = async (url, init) => {
+  const path = String(url);
+  updateFetch.push({ path, method: (init && init.method) || 'GET', body: init && init.body ? JSON.parse(init.body) : null });
+  if (path === '/poker/update-check') {
+    return { ok: true, json: async () => ({ ok: true, result: { ok: true, behind: true, current: '0.1.0', latest: 'v9.9.9', url: 'https://example.test/releases', lines: ['有新版本'] } }) };
+  }
+  if (path === '/poker/update-apply') {
+    return { ok: true, json: async () => ({ ok: true, result: { ok: true, updated: true, version: '9.9.9', lines: ['已从 v0.1.0 更新到 v9.9.9。'] } }) };
+  }
+  return { ok: true, json: async () => ({ ok: true, settings: { coachMode: 'simple' }, groups: [] }) };
+};
+let updateTree;
+let confirmed = 0;
+try {
+  globalThis.confirm = () => { confirmed += 1; return true; };
+  // The check is once-per-page-load, so start from "never checked": earlier renders in this
+  // suite already consumed the one automatic check.
+  exportsObject.__testing.resetUpdate();
+  updateTree = walkAll(render(headerComponent, { sessionId: session.id }));
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    await new Promise((resolve) => process.nextTick(resolve));
+    updateTree = walkAll(render(headerComponent, { sessionId: session.id }));
+    if (updateTree.some((node) => String(node.props.className || '').includes('dshp-updateDot'))) break;
+  }
+  check('the entry checks for a new release on its own',
+    updateFetch.some((entry) => entry.path === '/poker/update-check' && entry.method === 'POST'),
+    JSON.stringify(updateFetch.map((entry) => [entry.method, entry.path])));
+  check('a new release shows as a dot on the entry',
+    updateTree.some((node) => String(node.props.className || '').includes('dshp-updateDot')),
+    updateTree.filter((node) => typeof node.props.className === 'string').map((node) => node.props.className).slice(0, 6).join(' | '));
+} finally {
+  globalThis.fetch = originalUpdateFetch;
+  globalThis.confirm = originalConfirm;
+}
+check('the check runs once per page load',
+  updateFetch.filter((entry) => entry.path === '/poker/update-check').length === 1,
+  JSON.stringify(updateFetch.map((entry) => entry.path)));
+void confirmed;
+void walkAll;
+
+// The update button: offered only when there is something to update, and it asks first.
+const applyFetch = [];
+const originalApplyFetch = globalThis.fetch;
+const originalApplyConfirm = globalThis.confirm;
+globalThis.fetch = async (url, init) => {
+  const path = String(url);
+  applyFetch.push({ path, method: (init && init.method) || 'GET', body: init && init.body ? JSON.parse(init.body) : null });
+  if (path === '/poker/update-check') {
+    return { ok: true, json: async () => ({ ok: true, result: { ok: true, behind: true, current: '0.1.0', latest: 'v9.9.9', lines: ['有新版本'] } }) };
+  }
+  if (path === '/poker/update-apply') {
+    return { ok: true, json: async () => ({ ok: true, result: { ok: true, updated: true, version: '9.9.9', lines: ['已从 v0.1.0 更新到 v9.9.9。'] } }) };
+  }
+  return { ok: true, json: async () => ({ ok: true, settings: settingsSchema.publicSettings(settingsPayload), groups: settingsSchema.settingsForm(settingsSchema.publicSettings(settingsPayload), { version: '0.1.0' }) }) };
+};
+let applyTree;
+let applyConfirmed = 0;
+try {
+  globalThis.confirm = () => { applyConfirmed += 1; return true; };
+  exportsObject.__testing.resetUpdate();
+  await exportsObject.__testing.loadPluginSettings(true);
+  applyTree = walkAll(render(settingsRegistration.component, {}));
+  for (let attempt = 0; attempt < 20 && !applyTree.some((node) => node.type === 'button' && /更新/.test(flatten(node))); attempt += 1) {
+    await new Promise((resolve) => process.nextTick(resolve));
+    applyTree = walkAll(render(settingsRegistration.component, {}));
+  }
+  // Wait for the release state to arrive, then look again.
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await new Promise((resolve) => process.nextTick(resolve));
+    applyTree = walkAll(render(settingsRegistration.component, {}));
+    if (applyTree.some((node) => node.type === 'button' && /9\.9\.9/.test(flatten(node)))) break;
+  }
+  const applyButton = applyTree.find((node) => node.type === 'button' && /更新到 9\.9\.9|更新到 v9\.9\.9/.test(flatten(node)));
+  check('the settings offer an update button naming the new version', applyButton !== undefined,
+    applyTree.filter((node) => node.type === 'button').map((node) => flatten(node)).join(' | '));
+  check('the new version is stated on the row, not only in a button',
+    flatten(applyTree).includes('有新版本') && flatten(applyTree).includes('9.9.9'), flatten(applyTree).slice(-200));
+  const dismissLink = applyTree.find((node) => node.type === 'button' && /本次忽略/.test(flatten(node)));
+  check('a new version can be waved off for now', dismissLink !== undefined,
+    applyTree.filter((node) => node.type === 'button').map((node) => flatten(node)).join(' | '));
+  check('the update button is enabled while a new version is available',
+    applyButton !== undefined && applyButton.props.disabled !== true, String(applyButton && applyButton.props.disabled));
+  if (applyButton) {
+    await applyButton.props.onClick();
+    await new Promise((resolve) => process.nextTick(resolve));
+  }
+  check('the update asks for confirmation first', applyConfirmed === 1, String(applyConfirmed));
+  check('the update calls the plugin route',
+    applyFetch.some((entry) => entry.path === '/poker/update-apply' && entry.method === 'POST'),
+    JSON.stringify(applyFetch.map((entry) => [entry.method, entry.path])));
+  // "Not now" silences the prompt for the rest of the page's life - including the dot.
+  if (dismissLink) {
+    dismissLink.props.onClick();
+    await new Promise((resolve) => process.nextTick(resolve));
+  }
+  const afterDismiss = walkAll(render(headerComponent, { sessionId: session.id }));
+  check('waving it off hides the dot on the entry',
+    !afterDismiss.some((node) => String(node.props.className || '').includes('dshp-updateDot')),
+    afterDismiss.filter((node) => typeof node.props.className === 'string').map((node) => node.props.className).slice(0, 5).join(' | '));
+} finally {
+  globalThis.fetch = originalApplyFetch;
+  globalThis.confirm = originalApplyConfirm;
+}
+
+// Nothing newer: the same button re-checks instead, and asking "are you sure?" about a
+// re-check would be noise - so it must not confirm.
+const recheckFetch = [];
+const originalRecheckFetch = globalThis.fetch;
+const originalRecheckConfirm = globalThis.confirm;
+globalThis.fetch = async (url, init) => {
+  const path = String(url);
+  recheckFetch.push({ path, method: (init && init.method) || 'GET' });
+  if (path === '/poker/update-check') {
+    return { ok: true, json: async () => ({ ok: true, result: { ok: true, behind: false, current: '0.1.0', latest: 'v0.1.0', lines: ['已是最新版本。'] } }) };
+  }
+  if (path === '/poker/update-apply') {
+    return { ok: true, json: async () => ({ ok: true, result: { ok: true, updated: false, version: 'v0.1.0', lines: ['已是最新版本（v0.1.0），无需更新。'] } }) };
+  }
+  return { ok: true, json: async () => ({ ok: true, settings: settingsSchema.publicSettings(settingsPayload), groups: settingsSchema.settingsForm(settingsSchema.publicSettings(settingsPayload), { version: '0.1.0' }) }) };
+};
+let recheckConfirmed = 0;
+try {
+  globalThis.confirm = () => { recheckConfirmed += 1; return true; };
+  exportsObject.__testing.resetUpdate();
+  await exportsObject.__testing.loadPluginSettings(true);
+  let tree = walkAll(render(settingsRegistration.component, {}));
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await new Promise((resolve) => process.nextTick(resolve));
+    tree = walkAll(render(settingsRegistration.component, {}));
+    if (tree.some((node) => node.type === 'button' && /重新检查/.test(flatten(node)))) break;
+  }
+  const recheckButton = tree.find((node) => node.type === 'button' && /重新检查/.test(flatten(node)));
+  check('an up-to-date install gets a re-check link instead of an update button', recheckButton !== undefined,
+    tree.filter((node) => node.type === 'button').map((node) => flatten(node)).join(' | '));
+  check('the re-check link is not disabled', recheckButton !== undefined && recheckButton.props.disabled !== true,
+    String(recheckButton && recheckButton.props.disabled));
+  check('the state is printed as a statement, not a button',
+    flatten(tree).includes('已是最新版本（v0.1.0）'), flatten(tree).slice(-160));
+  if (recheckButton) {
+    await recheckButton.props.onClick();
+    await new Promise((resolve) => process.nextTick(resolve));
+  }
+  // "Not now" is a re-CHECK, not an update: it must bypass the cache and ask nothing.
+  check('re-checking asks nothing and bypasses the cache',
+    recheckConfirmed === 0
+      && recheckFetch.some((entry) => entry.path === '/poker/update-check' && entry.method === 'POST')
+      && !recheckFetch.some((entry) => entry.path === '/poker/update-apply'),
+    JSON.stringify({ confirmed: recheckConfirmed, calls: recheckFetch.map((entry) => entry.path) }));
+} finally {
+  globalThis.fetch = originalRecheckFetch;
+  globalThis.confirm = originalRecheckConfirm;
+}
 
 // ---- an unsettled (running) call must render a placeholder, not throw ----
 
