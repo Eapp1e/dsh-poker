@@ -982,7 +982,7 @@ check(
 );
 check('the button region is not folding everything', fullRingField.foldRate(2) < 0.75, String(fullRingField.foldRate(2)));
 
-// The complaint this guards: "翻前弃牌率也太高了" - a table where nobody opens and the
+// What this guards: a table where nobody opens and the
 // blinds chop it up. Measured over 3000 six-handed hands with the same instrument:
 // the pre-turn policy walked 23% of hands, the first tightening overshot to 41%
 // flops, and the tuning in place now walks 10% and shows a flop in 57%.

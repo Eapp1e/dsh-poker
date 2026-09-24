@@ -182,8 +182,6 @@ node test/pack.mjs    # 打包契约（dsh.bundle、一行描述、许可证等�
 
 每次 push 都会在 GitHub Actions 上跑（Node 20 / 22 矩阵）。
 
-想把它列进 [awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)？步骤与投稿条目见 [`SUBMISSION.md`](SUBMISSION.md)。变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
-
 ## License
 
 MIT

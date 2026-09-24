@@ -32,7 +32,6 @@ function check(name, condition, detail = '') {
 const manifest = JSON.parse(read('..', 'package.json'));
 const readme = read('..', 'README.md');
 const changelog = read('..', 'CHANGELOG.md');
-const submission = read('..', 'SUBMISSION.md');
 
 // ── it installs with `dsh plugin add` ──────────────────────────────────────
 
@@ -114,7 +113,7 @@ check('there are no runtime dependencies',
 
 // ── the repository is publishable: no machine paths, no scratch files ──────
 
-const shipped = ['package.json', 'cordis.patch.yml', 'README.md', 'CHANGELOG.md', 'SUBMISSION.md', 'LICENSE'];
+const shipped = ['package.json', 'cordis.patch.yml', 'README.md', 'CHANGELOG.md', 'LICENSE'];
 for (const file of shipped) {
   const text = read('..', file);
   check(`${file} has no absolute machine path`, !/[A-Za-z]:\\\\|[A-Za-z]:\/(Users|DeepSeekHarness)/.test(text), file);
@@ -136,15 +135,6 @@ for (const dir of ['lib', 'test']) {
 }
 const stray = fs.readdirSync(local('..')).filter((name) => name.startsWith('tmp-') || name.endsWith('.tgz'));
 check('no scratch files in the repository root', stray.length === 0, stray.join(', '));
-
-// ── the submission guide stays in step with the manifest ───────────────────
-
-check('SUBMISSION.md exists for the reviewer', submission.length > 500, `${submission.length} chars`);
-check('SUBMISSION.md quotes the inclusion rule', submission.includes('installs with `dsh plugin add`'), 'rule missing');
-check('SUBMISSION.md names the category', submission.includes('Just for Fun'), 'category missing');
-check('SUBMISSION.md repeats the one-liner', submission.includes(description), description);
-check('SUBMISSION.md tells the reader to add the dsh-plugin topic', submission.includes('dsh-plugin'), 'topic missing');
-check('SUBMISSION.md lists what still needs filling in', /TODO/.test(submission), 'no TODO markers');
 
 if (failures.length > 0) {
   console.error(`FAIL: ${failures.length} of ${passed + failures.length} checks failed`);

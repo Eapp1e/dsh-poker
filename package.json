@@ -15,7 +15,6 @@
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
-    "SUBMISSION.md",
     "LICENSE"
   ],
   "scripts": {

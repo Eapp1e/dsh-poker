@@ -55,9 +55,7 @@ All notable changes to this plugin are documented here. The format follows
   own tightness/aggression/bluff within a bounded range: a loose table gets tightened against, a
   table that folds to pressure gets bluffed more, an aggressive table gets respected. The player's
   own tendencies are part of that read.
-- A **submission guide** (`SUBMISSION.md`) plus CI (`.github/workflows/test.yml`) for listing the
-  plugin in the community registry: what the entry looks like, what a reviewer checks, and the
-  pre-flight commands.
+- CI (`.github/workflows/test.yml`) runs the whole suite on every push.
 - A **packaging contract suite** (`test/pack.mjs`, `npm test`): it asserts against this repository
   what a plugin registry checks before listing a package - the `dsh.bundle` patch installs, both
   halves are exported, the client half only requires the platform baseline, the one-line description
@@ -71,8 +69,8 @@ All notable changes to this plugin are documented here. The format follows
 
 ### Changed
 
-- **Bot preflop ranges, retuned against measurement.** The complaint was two-sided - "翻前弃牌率也太高"
-  and "allin 还喜欢跟" - and the old numbers caused both: the continuing range was 1.5x the *opening*
+- **Bot preflop ranges, retuned against measurement.** Playtesting showed two problems - bots folded
+  too much preflop and still called off all-ins - and the old numbers caused both: the continuing range was 1.5x the *opening*
   range (so 76% of bots continued against a big raise and 62% against a stack-committing one), while
   the opening table was tight enough that 23% of hands were walked to the big blind. Now the width
   comes from the **price and position**: the big blind, closing the action, defends wide; middle
